@@ -3,3 +3,4 @@ boto3>=1.34
 botocore>=1.34
 requests>=2.32
 streamlit-cognito-auth>=0.3 
+PyJWT>=2.9

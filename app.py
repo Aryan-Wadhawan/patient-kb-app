@@ -87,6 +87,35 @@ def get_user_sub(user_pool_id: str, username: str):
         print("User not found.")
         return None
 
+def get_user_sub_from_token() -> str | None:
+    """
+    Prefer reading 'sub' from the ID token claims (no admin permissions needed).
+    Falls back to AdminGetUser only if tokens are unavailable and IAM allows it.
+    """
+    # 1) Try to read from ID token
+    try:
+        id_token = getattr(authenticator, "get_id_token", lambda: None)()
+        if id_token:
+            import jwt  # PyJWT
+            claims = jwt.decode(id_token, options={"verify_signature": False})
+            return claims.get("sub")
+    except Exception:
+        pass  # fall through to optional admin call
+
+    # 2) Optional fallback: AdminGetUser (requires IAM perms)
+    try:
+        username = authenticator.get_username()
+        if not username:
+            return None
+        resp = cognito_idp.admin_get_user(UserPoolId=pool_id, Username=username)
+        for attr in resp.get("UserAttributes", []):
+            if attr.get("Name") == "sub":
+                return attr.get("Value")
+        return None
+    except Exception:
+        return None
+
+
 def get_patient_ids(doctor_id: str):
     resp = ddb.query(
         TableName=dynamo_table,
@@ -246,7 +275,11 @@ def _latest_ingestion_status(kb_id: str, data_source_id: str):
 if "busy" not in st.session_state:
     st.session_state.busy = False
 
-sub = get_user_sub(pool_id, authenticator.get_username())
+sub = get_user_sub_from_token()
+if not sub:
+    st.error("Could not determine your Clinician ID (sub). Please contact admin.")
+    st.stop()
+
 patient_ids = get_patient_ids(sub)
 
 with st.sidebar:
