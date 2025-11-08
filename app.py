@@ -20,7 +20,7 @@ AWS_REGION = st.secrets.get("AWS_REGION", "ap-southeast-2")
 # Required secrets (set in .streamlit/secrets.toml locally or Streamlit Cloud Secrets UI)
 pool_id            = st.secrets["COGNITO_POOL_ID"]
 app_client_id      = st.secrets["COGNITO_APP_CLIENT_ID"]
-app_client_secret  = st.secrets["COGNITO_APP_CLIENT_SECRET"]
+# app_client_secret  = st.secrets["COGNITO_APP_CLIENT_SECRET"]
 
 kb_id               = st.secrets["KB_ID"]
 lambda_function_arn = st.secrets["LAMBDA_FUNCTION_ARN"]
@@ -59,7 +59,7 @@ ddb            = session.client("dynamodb", config=boto_cfg)
 authenticator = CognitoAuthenticator(
     pool_id=pool_id,
     app_client_id=app_client_id,
-    app_client_secret=app_client_secret,
+    # app_client_secret=app_client_secret,
     use_cookies=False
 )
 
