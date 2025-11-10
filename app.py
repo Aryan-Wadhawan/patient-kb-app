@@ -9,8 +9,33 @@ import boto3
 from botocore.config import Config
 from streamlit_cognito_auth import CognitoAuthenticator
 
+import time
+import io
+from streamlit_mic_recorder import mic_recorder
+
+
 # Ensure Markdown mimetype is registered
 mimetypes.add_type("text/markdown", ".md")
+
+st.markdown("""
+<style>
+.search-row { display:flex; gap:.5rem; align-items:center; }
+.search-row input { height:42px; border-radius:10px; }
+.mic-btn button { padding:0 .65rem !important; height:42px; border-radius:10px; }
+.badge {display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;}
+.badge-green{background:#16a34a;color:white;}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+button[kind="primary"] {
+    margin-top: .5rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 
 # =========================
 # Config / Secrets
@@ -269,6 +294,58 @@ def _latest_ingestion_status(kb_id: str, data_source_id: str):
     j = jobs[0]
     return j["status"], j["ingestionJobId"], j.get("startedAt")
 
+
+# =========================
+# Voice / Transcribe helpers
+# =========================
+TRANSCRIBE_BUCKET      = st.secrets["TRANSCRIBE_BUCKET"]
+TRANSCRIBE_LANGUAGE    = st.secrets.get("TRANSCRIBE_LANGUAGE", "en-AU")
+TRANSCRIBE_MEDIA_FORMAT= st.secrets.get("TRANSCRIBE_MEDIA_FORMAT", "wav")
+
+transcribe = session.client("transcribe", config=boto_cfg)
+
+def _build_audio_key(doctor_sub: str, suffix: str = "wav") -> str:
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    uid = str(uuid4())[:8]
+    return f"inputs/{doctor_sub}/{ts}-{uid}.{suffix}"
+
+def _start_transcription_job(s3_uri: str) -> str:
+    job_name = f"sttx-{uuid4().hex[:16]}"
+    transcribe.start_transcription_job(
+        TranscriptionJobName=job_name,
+        Media={"MediaFileUri": s3_uri},
+        MediaFormat=TRANSCRIBE_MEDIA_FORMAT,
+        LanguageCode=TRANSCRIBE_LANGUAGE,
+        OutputBucketName=TRANSCRIBE_BUCKET,
+        OutputKey=f"outputs/{job_name}.json"
+    )
+    return job_name
+
+def _wait_transcription(job_name: str, timeout_s: int = 180) -> dict | None:
+    """Poll until COMPLETED/FAILED or timeout. Returns job dict or None."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        resp = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = resp["TranscriptionJob"]["TranscriptionJobStatus"]
+        if status == "COMPLETED":
+            return resp["TranscriptionJob"]
+        if status == "FAILED":
+            raise RuntimeError(resp["TranscriptionJob"].get("FailureReason", "Transcribe failed"))
+        time.sleep(2.0)
+    return None
+
+def _read_transcript_text(job_name: str) -> str:
+    # Transcribe wrote to our bucket/prefix set above
+    key = f"outputs/{job_name}.json"
+    blob = s3.get_object(Bucket=TRANSCRIBE_BUCKET, Key=key)["Body"].read()
+    data = json.loads(blob.decode("utf-8"))
+    # Typical shape: results.transcripts[0].transcript
+    return (data.get("results", {})
+                .get("transcripts", [{}])[0]
+                .get("transcript", "")).strip()
+
+
+
 # =========================
 # UI
 # =========================
@@ -284,12 +361,52 @@ patient_ids = get_patient_ids(sub)
 
 with st.sidebar:
     st.header("User Information")
+
     st.markdown("## Clinician")
     st.text(authenticator.get_username())
+
     st.markdown("## Clinician ID")
     st.text(sub or "(unknown)")
-    selected_patient = st.selectbox("Select a patient (or 'All' for all patients)", ['All'] + patient_ids)
-    st.button("Logout", "logout_btn", on_click=logout)
+
+    # Patient picker
+    selected_patient = st.selectbox(
+        "Select a patient (or 'All' for all patients)",
+        ['All'] + patient_ids,
+        key="patient_select"
+    )
+
+    st.divider()
+
+    # --- Add Patient (moved into sidebar) ---
+    st.subheader("Add patient")
+    with st.form("add_patient_form_sidebar", clear_on_submit=True):
+        new_pid_input = st.text_input(
+            "New Patient ID",
+            placeholder="e.g. f9ee14c8-5071-70f7-1ac4-89b2deb95960",
+            key="sidebar_new_pid"
+        )
+        add_submitted = st.form_submit_button("Add")
+
+    if add_submitted:
+        new_pid_val = (st.session_state.get("sidebar_new_pid") or "").strip()
+        if not new_pid_val:
+            st.warning("Please enter a patient ID.")
+        else:
+            try:
+                res = add_patient_to_doctor(dynamo_table, sub, new_pid_val)
+                if res == "exists":
+                    st.info(f"Patient {new_pid_val} is already assigned to this Clinician.")
+                else:
+                    st.success(f"Patient {new_pid_val} assigned.")
+                    st.rerun()  # refresh sidebar so the new patient appears immediately
+            except Exception as e:
+                st.error(f"Failed to add patient: {e}")
+
+    st.divider()
+
+    # Logout button stays last
+    st.button("Logout", key="logout_btn", on_click=logout)
+
 
 st.header("Secluded DataDissect environment")
 
@@ -309,25 +426,107 @@ try:
 except Exception as e:
     st.info(f"KB status unavailable: {e}")
 
-# --- Search ---
-query = st.text_input("Enter your search query:")
+# --- Unified search (text + inline mic) ---
+st.subheader("Search")
 
-if st.button("Search"):
-    if query:
-        patient_ids_filter = [selected_patient] if selected_patient != 'All' else patient_ids
-        results = search_transcript(sub, kb_id, query, patient_ids_filter)
-        if "error" in results:
-            st.error(results["error"])
-        elif "body" in results:
-            st.subheader("Search Results:")
-            st.markdown(results["body"], unsafe_allow_html=True)
+# init keys once
+st.session_state.setdefault("query_text_input", "")
+st.session_state.setdefault("last_results", None)
+st.session_state.setdefault("run_q", None)
+st.session_state.setdefault("prefill_text", None)  # <-- temp buffer for voice text
+
+# If we have a pending prefill from transcription, apply it BEFORE rendering the input
+if st.session_state["prefill_text"] is not None:
+    st.session_state["query_text_input"] = st.session_state["prefill_text"]
+    st.session_state["prefill_text"] = None
+
+# input row: text box + mic only
+c1, c2 = st.columns([12, 1])
+with c1:
+    st.text_input(
+        "Enter your search query:",
+        key="query_text_input",
+        label_visibility="collapsed",
+        placeholder="Type your question… or tap the mic"
+    )
+with c2:
+    audio = mic_recorder(
+        start_prompt="🎙",
+        stop_prompt="⏹",
+        format="wav",
+        just_once=True,
+        use_container_width=True,
+        key="mic_inline"
+    )
+
+# search button BELOW the input bar
+do_search = st.button("Search", type="primary", use_container_width=True)
+
+# if mic captured audio: upload → transcribe → stash to prefill_text → rerun
+if audio and audio.get("bytes"):
+    try:
+        audio_bytes = audio["bytes"]
+        key = _build_audio_key(sub, suffix=TRANSCRIBE_MEDIA_FORMAT)
+        s3.put_object(
+            Bucket=TRANSCRIBE_BUCKET,
+            Key=key,
+            Body=audio_bytes,
+            ContentType="audio/wav"
+        )
+        s3_uri = f"s3://{TRANSCRIBE_BUCKET}/{key}"
+        with st.spinner("Transcribing…"):
+            job_name = _start_transcription_job(s3_uri)
+            job = _wait_transcription(job_name, timeout_s=240)
+        if not job:
+            st.warning("Transcription timed out. Please try again.")
         else:
-            st.info("No content returned.")
-    else:
-        st.warning("Please enter a search query.")
-
+            text = _read_transcript_text(job_name)
+            if text:
+                # DO NOT touch query_text_input here; stash and rerun
+                st.session_state["prefill_text"] = text
+                st.toast("Transcript added to search box", icon="📝")
+                st.rerun()
+            else:
+                st.warning("No speech detected. Try again.")
+    except Exception as e:
+        st.error(f"Voice capture failed: {e}")
 st.divider()
-st.subheader("Upload to Knowledge Base")
+# Handle Search click (no auto-clearing per your request)
+if do_search:
+    q = (st.session_state.get("query_text_input") or "").strip()
+    if not q:
+        st.warning("Please enter a search query.")
+    else:
+        st.session_state["run_q"] = q
+        st.rerun()
+
+# Execute pending search (after rerun)
+if st.session_state.get("run_q"):
+    run_q = st.session_state["run_q"]
+    st.session_state["run_q"] = None
+    patient_ids_filter = [selected_patient] if selected_patient != 'All' else patient_ids
+    with st.spinner("Searching KB…"):
+        out = search_transcript(sub, kb_id, run_q, patient_ids_filter)
+    st.session_state["last_results"] = out
+    st.rerun()
+
+# render results (if any)
+if st.session_state.get("last_results"):
+    res = st.session_state["last_results"]
+    if "error" in res:
+        st.error(res["error"])
+    elif "body" in res:
+        st.subheader("Search Results")
+        st.markdown(res["body"], unsafe_allow_html=True)
+    else:
+        st.info("No content returned.")
+
+
+
+st.markdown("<div style='height:100px;'></div>", unsafe_allow_html=True)
+st.divider()
+# --- Add to knowledge base (renamed & simplified) ---
+st.subheader("Add to knowledge base")
 
 uploaded_files = st.file_uploader(
     "Choose files",
@@ -336,22 +535,15 @@ uploaded_files = st.file_uploader(
     help="Each file ≤ 50MB. CSV needs a 'content' column."
 )
 
-st.subheader("Manual entry to KB")
-
-col_a, col_b = st.columns([2, 1])
-with col_a:
-    typed_filename = st.text_input(
-        "Filename (no path)",
-        value="note.md",
-        help="Use .md for Markdown or .txt for plain text"
-    )
-with col_b:
+# Minimal manual entry UI (no filename)
+c_opt, _ = st.columns([1, 3])
+with c_opt:
     save_and_ingest = st.toggle("Start ingestion after saving", value=True)
 
 typed_content = st.text_area(
-    "Type your note (Markdown supported)",
+    label="",
     height=220,
-    placeholder="## Patient update\n- ...\n- ..."
+    placeholder="Write a quick note (Markdown supported)…"
 )
 
 col_btn1, col_btn2 = st.columns([1, 1])
@@ -366,26 +558,25 @@ if preview_btn and typed_content.strip():
 
 st.divider()
 
+# Manual note save (auto filename)
 if save_btn:
     if selected_patient == "All":
         st.warning("Please select a single patient in the sidebar first.")
-    elif not typed_filename.strip():
-        st.warning("Please enter a filename (e.g., note.md).")
-    elif not (typed_filename.lower().endswith(".md") or typed_filename.lower().endswith(".txt")):
-        st.warning("Filename must end with .md or .txt")
     elif not typed_content.strip():
         st.warning("The note is empty.")
     else:
         try:
             data_source_id, bucket = _get_kb_data_source(kb_id)
             file_bytes = typed_content.encode("utf-8")
+            auto_name = f"note-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.md"
+
             stored_key, meta_key = _put_file_and_metadata(
                 bucket=bucket,
-                filename=typed_filename,
+                filename=auto_name,
                 file_bytes=file_bytes,
                 patient_id=selected_patient
             )
-            st.success(f"Saved `{typed_filename}` as `s3://{bucket}/{stored_key}` (metadata: `{meta_key}`).")
+            st.success(f"Saved `{auto_name}` as `s3://{bucket}/{stored_key}` (metadata: `{meta_key}`).")
 
             if save_and_ingest:
                 job_id = _start_ingestion(kb_id, data_source_id)
@@ -393,6 +584,7 @@ if save_btn:
         except Exception as e:
             st.error(f"Failed to save or ingest note: {e}")
 
+# Upload files area
 col1, col2 = st.columns([1, 1])
 with col1:
     do_ingest = st.button("Upload & Start Ingestion", type="primary")
@@ -419,24 +611,3 @@ if (do_ingest or just_upload):
                 st.info(f"Started ingestion job: {job_id}. Click 'Refresh KB status' above to check progress.")
         except Exception as e:
             st.error(f"Upload/ingest failed: {e}")
-
-st.divider()
-st.subheader("Add Patient to This Clinician")
-
-with st.form("add_patient_form"):
-    new_pid = st.text_input("New Patient ID (e.g., f9ee14c8-5071-70f7-1ac4-89b2deb95960)").strip()
-    add_submitted = st.form_submit_button("Add Patient")
-
-if add_submitted:
-    if not new_pid:
-        st.warning("Please enter a patient ID.")
-    else:
-        try:
-            res = add_patient_to_doctor(dynamo_table, sub, new_pid)
-            if res == "exists":
-                st.info(f"Patient {new_pid} is already assigned to this Clinician.")
-            else:
-                st.success(f"Patient {new_pid} assigned.")
-                st.rerun()
-        except Exception as e:
-            st.error(f"Failed to add patient: {e}")
