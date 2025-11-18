@@ -1410,7 +1410,7 @@ else:
     with col_empty1:
         st.info("💬 Start a conversation by asking a question below")
     with col_empty2:
-        if st.button("🔄 New Chat", key="new_chat_btn_empty", help="Start a new chat session", use_container_width=True, disabled=True):
+        if st.button("🔄", key="new_chat_btn_empty", help="Start a new chat session", use_container_width=True, disabled=True):
             pass
 
 # init keys once
