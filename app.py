@@ -1219,6 +1219,12 @@ def auto_detect_upload_callback():
 if "busy" not in st.session_state:
     st.session_state.busy = False
 
+# Initialize request tracking state
+if "current_request_id" not in st.session_state:
+    st.session_state.current_request_id = None
+if "request_context" not in st.session_state:
+    st.session_state.request_context = None
+
 sub = get_user_sub_from_token()
 if not sub:
     st.error("Could not determine your Clinician ID (sub). Please contact admin.")
@@ -1302,10 +1308,21 @@ with col_slogic:
         "Logic",
         options,
         key="search_filter_logic_select",
-        label_visibility="visible"
+        label_visibility="visible",
+        disabled=st.session_state.busy
     )
     # Sync the boolean logic state with the selectbox value
-    st.session_state.search_filter_logic = (selected_logic == "AND")
+    new_logic = (selected_logic == "AND")
+    
+    # If filter changed during loading, invalidate current request
+    if st.session_state.busy and st.session_state.current_request_id:
+        if new_logic != st.session_state.search_filter_logic:
+            # Filter changed - invalidate current request
+            st.session_state.current_request_id = None
+            st.session_state.request_context = None
+            st.session_state.busy = False
+    
+    st.session_state.search_filter_logic = new_logic
 
 with col_sdiv1:
     st.markdown('<span class="pill-divider"></span>', unsafe_allow_html=True)
@@ -1316,8 +1333,18 @@ with col_spatient:
         patient_ids,
         default=st.session_state.search_patient_ids,
         key="search_patient_multiselect",
-        label_visibility="visible"
+        label_visibility="visible",
+        disabled=st.session_state.busy
     )
+    
+    # If filter changed during loading, invalidate current request
+    if st.session_state.busy and st.session_state.current_request_id:
+        if set(selected_search_patients) != set(st.session_state.search_patient_ids):
+            # Filter changed - invalidate current request
+            st.session_state.current_request_id = None
+            st.session_state.request_context = None
+            st.session_state.busy = False
+    
     st.session_state.search_patient_ids = selected_search_patients
     if selected_search_patients:
         display_text = f"👤 {len(selected_search_patients)} patient(s)"
@@ -1329,8 +1356,18 @@ with col_sdoctype:
         ["ultrasound", "pathology", "other"],
         default=st.session_state.search_doc_types,
         key="search_doc_type_multiselect",
-        label_visibility="visible"
+        label_visibility="visible",
+        disabled=st.session_state.busy
     )
+    
+    # If filter changed during loading, invalidate current request
+    if st.session_state.busy and st.session_state.current_request_id:
+        if set(selected_doc_types) != set(st.session_state.search_doc_types):
+            # Filter changed - invalidate current request
+            st.session_state.current_request_id = None
+            st.session_state.request_context = None
+            st.session_state.busy = False
+    
     st.session_state.search_doc_types = selected_doc_types
     if selected_doc_types:
         display_text = f"📄 {', '.join(selected_doc_types)}"
@@ -1342,10 +1379,22 @@ with col_smisc:
         value=", ".join(st.session_state.search_misc_tags),
         key="search_misc_input",
         help="Comma-separated tags",
-        label_visibility="visible"
+        label_visibility="visible",
+        disabled=st.session_state.busy
     )
+    
+    new_misc_tags = [tag.strip() for tag in misc_input.split(",") if tag.strip()] if misc_input else []
+    
+    # If filter changed during loading, invalidate current request
+    if st.session_state.busy and st.session_state.current_request_id:
+        if set(new_misc_tags) != set(st.session_state.search_misc_tags):
+            # Filter changed - invalidate current request
+            st.session_state.current_request_id = None
+            st.session_state.request_context = None
+            st.session_state.busy = False
+    
     if misc_input:
-        st.session_state.search_misc_tags = [tag.strip() for tag in misc_input.split(",") if tag.strip()]
+        st.session_state.search_misc_tags = new_misc_tags
     else:
         st.session_state.search_misc_tags = []
     if st.session_state.search_misc_tags:
@@ -1355,6 +1404,10 @@ with col_smisc:
         st.markdown(f'<span class="pill pill-misc">{display_text}</span>', unsafe_allow_html=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
+
+# Show loading indicator when busy
+if st.session_state.busy:
+    st.info("⏳ Processing your request... Please wait. Changing filters will cancel this request.")
 
 # Initialize chat session state
 if "chat_messages" not in st.session_state:
@@ -1450,7 +1503,7 @@ with c2:
     )
 
 # search button BELOW the input bar
-do_search = st.button("Send", type="primary", use_container_width=True)
+do_search = st.button("Send", type="primary", use_container_width=True, disabled=st.session_state.busy)
 
 # if mic captured audio: upload → transcribe → stash to prefill_text → rerun
 if audio and audio.get("bytes"):
@@ -1483,70 +1536,124 @@ if audio and audio.get("bytes"):
 st.divider()
 # Handle Send click
 if do_search:
-    current_input_key = f"query_text_input_{st.session_state.input_key_counter}"
-    q = (st.session_state.get(current_input_key) or "").strip()
-    if not q:
-        st.warning("Please enter a message.")
+    # Prevent new requests if already busy
+    if st.session_state.busy:
+        st.warning("Please wait for the current request to complete.")
     else:
-        st.session_state["run_q"] = q
-        st.rerun()
+        current_input_key = f"query_text_input_{st.session_state.input_key_counter}"
+        q = (st.session_state.get(current_input_key) or "").strip()
+        if not q:
+            st.warning("Please enter a message.")
+        else:
+            # Generate unique request ID
+            request_id = str(uuid4())
+            
+            # Capture filter state snapshot at request time
+            if st.session_state.search_patient_ids:
+                patient_ids_filter = st.session_state.search_patient_ids.copy()
+            else:
+                patient_ids_filter = patient_ids.copy()
+            
+            filter_params_snapshot = None
+            if (st.session_state.search_doc_types or 
+                st.session_state.search_misc_tags or 
+                st.session_state.search_patient_ids):
+                filter_params_snapshot = {
+                    "filter_logic": "AND" if st.session_state.search_filter_logic else "OR",
+                    "patient_ids": patient_ids_filter.copy(),
+                    "document_types": st.session_state.search_doc_types.copy() if st.session_state.search_doc_types else [],
+                    "miscellaneous_tags": st.session_state.search_misc_tags.copy() if st.session_state.search_misc_tags else []
+                }
+            
+            # Store request context
+            st.session_state.request_context = {
+                "request_id": request_id,
+                "query": q,
+                "patient_ids_filter": patient_ids_filter,
+                "filter_params": filter_params_snapshot,
+                "bedrock_session_id": st.session_state.bedrock_session_id,
+                "timestamp": datetime.now()
+            }
+            
+            # Set current request ID and mark as busy
+            st.session_state.current_request_id = request_id
+            st.session_state.busy = True
+            st.session_state["run_q"] = q
+            st.rerun()
 
 # Execute pending search (after rerun)
-if st.session_state.get("run_q"):
+if st.session_state.get("run_q") and st.session_state.request_context:
+    # Get the request context snapshot (captured at request time)
+    req_ctx = st.session_state.request_context
+    request_id = req_ctx["request_id"]
     run_q = st.session_state["run_q"]
     st.session_state["run_q"] = None
     
-    # Add user message to chat history
-    st.session_state.chat_messages.append({
-        "role": "user",
-        "content": run_q,
-        "timestamp": datetime.now()
-    })
+    # Validate this is still the current request (user hasn't changed filters/query)
+    if request_id != st.session_state.current_request_id:
+        # Request is stale - user changed something, ignore this response
+        st.session_state.busy = False
+        st.rerun()
+        st.stop()
     
-    # Build filter parameters from search pills
-    # Use search pills if any are selected, otherwise use all patients
-    if st.session_state.search_patient_ids:
-        patient_ids_filter = st.session_state.search_patient_ids
-    else:
-        patient_ids_filter = patient_ids
-    
-    # Only create filter_params if there are any filters beyond patient_id
-    filter_params = None
-    if (st.session_state.search_doc_types or 
-        st.session_state.search_misc_tags or 
-        st.session_state.search_patient_ids):  # If using search pills for patients
-        filter_params = {
-            "filter_logic": "AND" if st.session_state.search_filter_logic else "OR",
-            "patient_ids": patient_ids_filter,
-            "document_types": st.session_state.search_doc_types,
-            "miscellaneous_tags": st.session_state.search_misc_tags
-        }
-    
-    with st.spinner("Thinking…"):
-        # Pass Bedrock sessionId for conversation context (None for first request)
-        out = search_transcript(sub, kb_id, run_q, patient_ids_filter, filter_params, st.session_state.bedrock_session_id)
-    
-    # Store the sessionId from response for next request
-    if "sessionId" in out and out["sessionId"]:
-        st.session_state.bedrock_session_id = out["sessionId"]
-    
-    # Add assistant response to chat history
-    if "error" in out:
-        assistant_content = f"Error: {out['error']}"
-    elif "body" in out:
-        assistant_content = out["body"]
-    else:
-        assistant_content = "No content returned."
-    
-    st.session_state.chat_messages.append({
-        "role": "assistant",
-        "content": assistant_content,
-        "timestamp": datetime.now()
-    })
-    
-    # Clear the input after sending by incrementing the key counter
-    st.session_state.input_key_counter += 1
-    st.rerun()
+    try:
+        # Add user message to chat history
+        st.session_state.chat_messages.append({
+            "role": "user",
+            "content": run_q,
+            "timestamp": datetime.now()
+        })
+        
+        # Use snapshot context instead of live session state
+        patient_ids_filter = req_ctx["patient_ids_filter"]
+        filter_params = req_ctx["filter_params"]
+        bedrock_session_id = req_ctx["bedrock_session_id"]
+        
+        with st.spinner("Thinking…"):
+            # Pass Bedrock sessionId for conversation context (from snapshot)
+            out = search_transcript(sub, kb_id, run_q, patient_ids_filter, filter_params, bedrock_session_id)
+        
+        # Validate response is still for current request (double-check after async operation)
+        if request_id != st.session_state.current_request_id:
+            # Request became stale during async operation - ignore response
+            st.session_state.busy = False
+            st.rerun()
+            st.stop()
+        
+        # Store the sessionId from response for next request
+        if "sessionId" in out and out["sessionId"]:
+            st.session_state.bedrock_session_id = out["sessionId"]
+        
+        # Add assistant response to chat history
+        if "error" in out:
+            assistant_content = f"Error: {out['error']}"
+        elif "body" in out:
+            assistant_content = out["body"]
+        else:
+            assistant_content = "No content returned."
+        
+        st.session_state.chat_messages.append({
+            "role": "assistant",
+            "content": assistant_content,
+            "timestamp": datetime.now()
+        })
+    except Exception as e:
+        # Handle errors gracefully - add error message to chat
+        st.session_state.chat_messages.append({
+            "role": "assistant",
+            "content": f"Error: {str(e)}",
+            "timestamp": datetime.now()
+        })
+        st.error(f"Search failed: {e}")
+    finally:
+        # Always clear request tracking and busy flag, even on error
+        st.session_state.current_request_id = None
+        st.session_state.request_context = None
+        st.session_state.busy = False
+        
+        # Clear the input after sending by incrementing the key counter
+        st.session_state.input_key_counter += 1
+        st.rerun()
 
 
 
