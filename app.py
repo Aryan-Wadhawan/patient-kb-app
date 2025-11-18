@@ -303,7 +303,7 @@ def _construct_metadata_filter(filter_params: dict) -> dict:
         return filters[0]
     
     # Multiple filters - use AND or OR logic
-    filter_logic = filter_params.get("filter_logic", "AND")
+    filter_logic = filter_params.get("filter_logic", "OR")
     if filter_logic == "AND":
         return {"andAll": filters}
     else:
@@ -1275,7 +1275,7 @@ st.subheader("Search")
 
 # Initialize search filter session state
 if "search_filter_logic" not in st.session_state:
-    st.session_state.search_filter_logic = True  # AND by default
+    st.session_state.search_filter_logic = False  # OR by default
 if "search_patient_ids" not in st.session_state:
     st.session_state.search_patient_ids = []
 if "search_doc_types" not in st.session_state:
@@ -1295,7 +1295,7 @@ with col_slogic:
     
     # Initialize selectbox value in session state if needed
     if "search_filter_logic_select" not in st.session_state:
-        st.session_state.search_filter_logic_select = "AND" if st.session_state.search_filter_logic else "OR"
+        st.session_state.search_filter_logic_select = "OR" if not st.session_state.search_filter_logic else "AND"
     
     # Let Streamlit manage the widget state via key
     selected_logic = st.selectbox(
