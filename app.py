@@ -1415,12 +1415,19 @@ else:
 
 # init keys once
 st.session_state.setdefault("run_q", None)
-st.session_state.setdefault("prefill_text", None)  # <-- temp buffer for voice text
 
-# Get prefill text if available (before widget creation)
-prefill_value = ""
-if st.session_state["prefill_text"] is not None:
-    prefill_value = st.session_state["prefill_text"]
+# Initialize the input key counter if needed
+if "input_key_counter" not in st.session_state:
+    st.session_state.input_key_counter = 0
+
+# Get the current input widget key
+current_input_key = f"query_text_input_{st.session_state.input_key_counter}"
+
+# Check if we have prefill text to apply (set by transcription)
+if "prefill_text" in st.session_state and st.session_state["prefill_text"] is not None:
+    # Directly set the widget value in session state
+    st.session_state[current_input_key] = st.session_state["prefill_text"]
+    # Clear the prefill_text flag
     st.session_state["prefill_text"] = None
 
 # input row: text box + mic only
@@ -1428,8 +1435,7 @@ c1, c2 = st.columns([12, 1])
 with c1:
     st.text_input(
         "Enter your message:",
-        key=f"query_text_input_{st.session_state.input_key_counter}",
-        value=prefill_value,
+        key=current_input_key,
         label_visibility="collapsed",
         placeholder="Type your message… or tap the mic"
     )
