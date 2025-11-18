@@ -3,6 +3,7 @@ import re
 import mimetypes
 from uuid import uuid4
 from datetime import datetime
+from typing import Optional, Union
 
 import streamlit as st
 import boto3
@@ -24,6 +25,22 @@ st.markdown("""
 .mic-btn button { padding:0 .65rem !important; height:42px; border-radius:10px; }
 .badge {display:inline-block;padding:4px 10px;border-radius:999px;font-weight:600;}
 .badge-green{background:#16a34a;color:white;}
+
+/* Pill styling */
+.pill-container { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
+.pill { display: inline-flex; align-items: center; padding: 6px 12px; border-radius: 999px; font-size: 0.875rem; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+.pill-filter-logic { background: #6366f1; color: white; border: 2px solid #6366f1; }
+.pill-filter-logic:hover { background: #4f46e5; border-color: #4f46e5; }
+.pill-patient { background: #3b82f6; color: white; border: 2px solid #3b82f6; }
+.pill-patient:hover { background: #2563eb; border-color: #2563eb; }
+.pill-doc-type { background: #10b981; color: white; border: 2px solid #10b981; }
+.pill-doc-type:hover { background: #059669; border-color: #059669; }
+.pill-date { background: #f59e0b; color: white; border: 2px solid #f59e0b; }
+.pill-date:hover { background: #d97706; border-color: #d97706; }
+.pill-misc { background: #8b5cf6; color: white; border: 2px solid #8b5cf6; }
+.pill-misc:hover { background: #7c3aed; border-color: #7c3aed; }
+.pill-divider { width: 2px; height: 24px; background: #e5e7eb; margin: 0 0.25rem; }
+.pill-expanded { margin-top: 0.5rem; padding: 0.75rem; background: #f9fafb; border-radius: 8px; border: 1px solid #e5e7eb; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -74,6 +91,7 @@ session = boto3.Session(
 
 s3             = session.client("s3", config=boto_cfg)
 bedrock_agent  = session.client("bedrock-agent", config=boto_cfg)
+bedrock_runtime = session.client("bedrock-runtime", config=boto_cfg)
 cognito_idp    = session.client("cognito-idp", config=boto_cfg)
 lambda_client  = session.client("lambda", config=boto_cfg)
 ddb            = session.client("dynamodb", config=boto_cfg)
@@ -112,7 +130,7 @@ def get_user_sub(user_pool_id: str, username: str):
         print("User not found.")
         return None
 
-def get_user_sub_from_token() -> str | None:
+def get_user_sub_from_token() -> Optional[str]:
     """
     Prefer reading 'sub' from the ID token claims (no admin permissions needed).
     Falls back to AdminGetUser only if tokens are unavailable and IAM allows it.
@@ -184,12 +202,97 @@ def add_patient_to_doctor(table_name: str, doctor_id: str, new_patient_id: str):
     )
     return "added"
 
-def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[str]):
+def _construct_metadata_filter(filter_params: dict) -> dict:
+    """
+    Construct AWS Bedrock metadata filter from filter parameters.
+    Note: patient_id filtering is handled separately for access control.
+    Returns a filter dict compatible with Bedrock Knowledge Base filtering.
+    """
+    filters = []
+    
+    # Document type filter
+    if filter_params.get("document_types"):
+        doc_types = filter_params["document_types"]
+        if len(doc_types) == 1:
+            filters.append({
+                "equals": {
+                    "key": "document_type",
+                    "value": doc_types[0]
+                }
+            })
+        else:
+            filters.append({
+                "in": {
+                    "key": "document_type",
+                    "value": doc_types
+                }
+            })
+    
+    # Miscellaneous tags filter
+    if filter_params.get("miscellaneous_tags"):
+        misc_tags = filter_params["miscellaneous_tags"]
+        if len(misc_tags) == 1:
+            filters.append({
+                "listContains": {
+                    "key": "miscellaneous_tags",
+                    "value": misc_tags[0]
+                }
+            })
+        else:
+            # For multiple tags, use OR logic within the tag filter
+            tag_filters = [{
+                "listContains": {
+                    "key": "miscellaneous_tags",
+                    "value": tag
+                }
+            } for tag in misc_tags]
+            filters.append({
+                "orAll": tag_filters
+            })
+    
+    # Construct final filter based on logic type
+    if not filters:
+        return None
+    
+    if len(filters) == 1:
+        return filters[0]
+    
+    # Multiple filters - use AND or OR logic
+    filter_logic = filter_params.get("filter_logic", "AND")
+    if filter_logic == "AND":
+        return {"andAll": filters}
+    else:
+        return {"orAll": filters}
+
+def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[str], filter_params: dict = None):
+    """
+    Search knowledge base with optional metadata filtering.
+    
+    Args:
+        doctor_id: Doctor ID
+        kb_id: Knowledge base ID
+        text: Search query text
+        patient_ids: List of patient IDs (for access control)
+        filter_params: Optional dict with filter parameters:
+            - filter_logic: "AND" or "OR"
+            - patient_ids: List of patient IDs (can override the patient_ids param)
+            - document_types: List of document types
+            - miscellaneous_tags: List of miscellaneous tags
+    """
+    # Use filter_params patient_ids if provided, otherwise use the param
+    final_patient_ids = filter_params.get("patient_ids", patient_ids) if filter_params else patient_ids
+    
+    # Construct metadata filter
+    metadata_filter = None
+    if filter_params:
+        metadata_filter = _construct_metadata_filter(filter_params)
+    
     payload = {
         "doctorId": doctor_id,
         "knowledgeBaseId": kb_id,
         "text": text,
-        "patientIds": patient_ids
+        "patientIds": final_patient_ids,
+        "metadataFilter": metadata_filter
     }
 
     try:
@@ -253,7 +356,20 @@ def _guess_content_type(key: str) -> str:
     ctype, _ = mimetypes.guess_type(key)
     return ctype or "application/octet-stream"
 
-def _put_file_and_metadata(bucket: str, filename: str, file_bytes: bytes, patient_id: str):
+def _put_file_and_metadata(bucket: str, filename: str, file_bytes: bytes, patient_id: str, 
+                           document_type: str = "other", date: str = None, miscellaneous_tags: list = None):
+    """
+    Upload file and metadata to S3.
+    
+    Args:
+        bucket: S3 bucket name
+        filename: Original filename
+        file_bytes: File content as bytes
+        patient_id: Patient ID (required)
+        document_type: Document type (ultrasound/pathology/other)
+        date: Date in ISO format (YYYY-MM-DD), defaults to today if None
+        miscellaneous_tags: List of miscellaneous tag strings
+    """
     key = _build_unique_key(patient_id, filename)
 
     # 1) Upload the source file
@@ -266,7 +382,24 @@ def _put_file_and_metadata(bucket: str, filename: str, file_bytes: bytes, patien
 
     # 2) Upload metadata JSON next to it
     meta_key = f"{key}.metadata.json"
-    metadata_doc = {"metadataAttributes": {"patient_id": patient_id}}
+    
+    # Default date to today if not provided
+    if date is None:
+        date = datetime.utcnow().strftime("%Y-%m-%d")
+    
+    # Build metadata document
+    metadata_attrs = {
+        "patient_id": patient_id,
+        "document_type": document_type,
+        "date": date
+    }
+    
+    # Add miscellaneous_tags if provided
+    if miscellaneous_tags and len(miscellaneous_tags) > 0:
+        metadata_attrs["miscellaneous_tags"] = miscellaneous_tags
+    
+    metadata_doc = {"metadataAttributes": metadata_attrs}
+    
     s3.put_object(
         Bucket=bucket,
         Key=meta_key,
@@ -321,7 +454,7 @@ def _start_transcription_job(s3_uri: str) -> str:
     )
     return job_name
 
-def _wait_transcription(job_name: str, timeout_s: int = 180) -> dict | None:
+def _wait_transcription(job_name: str, timeout_s: int = 180) -> Optional[dict]:
     """Poll until COMPLETED/FAILED or timeout. Returns job dict or None."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -344,7 +477,624 @@ def _read_transcript_text(job_name: str) -> str:
                 .get("transcripts", [{}])[0]
                 .get("transcript", "")).strip()
 
+def _render_tagging_pills(patient_ids: list, default_patient: str = None, key_prefix: str = "note"):
+    """
+    Render pill-based tagging UI for upload/note saving.
+    Returns: dict with selected tags
+    
+    Args:
+        patient_ids: List of patient IDs
+        default_patient: Default patient ID to select
+        key_prefix: Prefix for widget keys to avoid duplicates (use "note" for manual notes, "upload" for file uploads)
+    """
+    # Initialize session state with prefix-specific keys
+    patient_key = f"{key_prefix}_tag_patient_id"
+    doc_type_key = f"{key_prefix}_tag_document_type"
+    date_key = f"{key_prefix}_tag_date"
+    misc_key = f"{key_prefix}_tag_misc"
+    
+    if patient_key not in st.session_state:
+        st.session_state[patient_key] = default_patient if default_patient and default_patient != "All" else (patient_ids[0] if patient_ids else None)
+    if doc_type_key not in st.session_state:
+        st.session_state[doc_type_key] = "other"
+    if date_key not in st.session_state:
+        st.session_state[date_key] = datetime.utcnow().date()
+    if misc_key not in st.session_state:
+        st.session_state[misc_key] = []
+    
+    # Render pills container
+    st.markdown('<div class="pill-container">', unsafe_allow_html=True)
+    
+    # Note: AND/OR logic is only used during SEARCH, not during file upload
+    # During upload, tags are simply stored as metadata attributes
+    col_patient, col_doc, col_date, col_misc = st.columns([2, 2, 2, 2])
+    
+    with col_patient:
+        display_patient = st.session_state[patient_key][:15] + "..." if st.session_state[patient_key] and len(st.session_state[patient_key]) > 15 else (st.session_state[patient_key] or "Select")
+        st.markdown(f'<span class="pill pill-patient">👤 {display_patient}</span>', unsafe_allow_html=True)
+        with st.expander("👤 Patient", expanded=False):
+            selected_patient = st.selectbox(
+                "Select Patient",
+                patient_ids,
+                index=patient_ids.index(st.session_state[patient_key]) if st.session_state[patient_key] in patient_ids else 0,
+                key=f"{key_prefix}_select_tag_patient",
+                label_visibility="visible"
+            )
+            st.session_state[patient_key] = selected_patient
+    
+    with col_doc:
+        st.markdown(f'<span class="pill pill-doc-type">📄 {st.session_state[doc_type_key]}</span>', unsafe_allow_html=True)
+        with st.expander("📄 Doc Type", expanded=False):
+            doc_type = st.selectbox(
+                "Document Type",
+                ["ultrasound", "pathology", "other"],
+                index=["ultrasound", "pathology", "other"].index(st.session_state[doc_type_key]),
+                key=f"{key_prefix}_select_tag_doc_type",
+                label_visibility="visible"
+            )
+            st.session_state[doc_type_key] = doc_type
+    
+    with col_date:
+        st.markdown(f'<span class="pill pill-date">📅 {st.session_state[date_key].strftime("%Y-%m-%d")}</span>', unsafe_allow_html=True)
+        with st.expander("📅 Date", expanded=False):
+            selected_date = st.date_input(
+                "Date",
+                value=st.session_state[date_key],
+                key=f"{key_prefix}_tag_date_input",
+                label_visibility="visible"
+            )
+            st.session_state[date_key] = selected_date
+    
+    with col_misc:
+        misc_display = ", ".join(st.session_state[misc_key][:1]) if st.session_state[misc_key] else "Add"
+        if len(st.session_state[misc_key]) > 1:
+            misc_display += f" (+{len(st.session_state[misc_key]) - 1})"
+        st.markdown(f'<span class="pill pill-misc">🏷️ {misc_display}</span>', unsafe_allow_html=True)
+        with st.expander("🏷️ Misc", expanded=False):
+            misc_tags_input_key = f"{key_prefix}_input_misc_tags"
+            # Sync text input with tags list - update if tags were added via buttons
+            current_tags_str = ", ".join(st.session_state[misc_key]) if st.session_state[misc_key] else ""
+            if misc_tags_input_key not in st.session_state:
+                st.session_state[misc_tags_input_key] = current_tags_str
+            else:
+                # If tags list changed (e.g., via button clicks), sync the input
+                existing_input = st.session_state[misc_tags_input_key]
+                existing_tags_from_input = [tag.strip() for tag in existing_input.split(",") if tag.strip()] if existing_input else []
+                # Compare sets to see if tags list was updated externally
+                if set(st.session_state[misc_key]) != set(existing_tags_from_input):
+                    st.session_state[misc_tags_input_key] = current_tags_str
+            
+            misc_tags = st.text_input(
+                "Misc Tags",
+                value=st.session_state[misc_tags_input_key],
+                key=misc_tags_input_key,
+                help="Comma-separated tags (e.g., 'urgent, follow-up, routine')",
+                label_visibility="visible"
+            )
+            # Update tags list based on the text input value
+            # Read from session state to ensure we get the latest value
+            current_input_value = st.session_state.get(misc_tags_input_key, "")
+            if current_input_value and current_input_value.strip():
+                parsed_tags = [tag.strip() for tag in current_input_value.split(",") if tag.strip()]
+                st.session_state[misc_key] = parsed_tags
+            else:
+                st.session_state[misc_key] = []
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    return {
+        "patient_id": st.session_state[patient_key],
+        "document_type": st.session_state[doc_type_key],
+        "date": st.session_state[date_key].strftime("%Y-%m-%d"),
+        "miscellaneous_tags": st.session_state[misc_key]
+        # Note: filter_logic is NOT used during upload - it's only used during search
+        # The AND/OR toggle you see in the search section controls how multiple filters are combined when querying
+    }
 
+def _extract_any_patient_id(content: str) -> Optional[str]:
+    """
+    Extract any patient ID from content using AI only (no algorithmic pattern matching).
+    Returns: patient ID if found, None otherwise
+    """
+    if not content or not content.strip():
+        return None
+    
+    # Use AI to extract patient identifier
+    content_preview = content[:3000] if len(content) > 3000 else content
+    
+    prompt = f"""Analyze the following medical document and extract the patient identifier.
+Look for:
+- Patient ID fields (e.g., "Patient ID: 123", "Patient: 5")
+- Patient identifiers (UUIDs or text like "Patient 1", "Patient 5")
+- UUIDs in the format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+- Any explicit patient ID mentions
+
+Document content:
+{content_preview}
+
+CRITICAL: Respond with ONLY the patient identifier itself, nothing else. Do not include any explanation, sentence, or additional text.
+Examples:
+- If you see "Patient ID: 4567", respond with: 4567
+- If you see "Patient identifier is ABC123", respond with: ABC123
+- If you see a UUID "f9ee14c8-5071-70f7-1ac4-89b2deb95960", respond with: f9ee14c8-5071-70f7-1ac4-89b2deb95960
+
+If no patient ID is found, respond with exactly: NOT_FOUND"""
+
+    try:
+        model_id = f"anthropic.claude-3-haiku-20240307-v1:0"
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 50,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        result = response_body.get('content', [{}])[0].get('text', '').strip()
+        
+        # Post-process to extract just the ID if AI returned a sentence
+        if result and result != "NOT_FOUND":
+            # Remove common prefixes/suffixes that AI might add
+            result = result.strip()
+            
+            # Try to extract UUID pattern
+            uuid_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+            uuid_match = re.search(uuid_pattern, result)
+            if uuid_match:
+                return uuid_match.group(0)
+            
+            # Try to extract after common phrases (handles sentences like "The patient identifier in the document is 4567")
+            patterns = [
+                r'(?:patient\s*(?:id|identifier|ID|Identifier)?\s*(?:in\s+the\s+document\s+)?(?:is|:|=)\s*)([A-Za-z0-9\-_]+)',
+                r'(?:identifier\s*(?:in\s+the\s+document\s+)?(?:is|:|=)\s*)([A-Za-z0-9\-_]+)',
+                r'(?:ID\s*(?:in\s+the\s+document\s+)?(?:is|:|=)\s*)([A-Za-z0-9\-_]+)',
+                r'(?:is\s+)([A-Za-z0-9\-_]+)(?:\s*\.?\s*$)',  # "is 4567." at end
+                r'(?:document\s+is\s+)([A-Za-z0-9\-_]+)',  # "document is 4567"
+                r'(?:is\s+)([A-Za-z0-9\-_]+)(?:\s*\.)',  # "is 4567." anywhere
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, result, re.IGNORECASE)
+                if match:
+                    extracted = match.group(1).strip()
+                    # Remove trailing punctuation
+                    extracted = re.sub(r'[.,;:!?]+$', '', extracted)
+                    if extracted and len(extracted) > 0:
+                        return extracted
+            
+            # If result looks like it might be just the ID (alphanumeric, no spaces, reasonable length)
+            if re.match(r'^[A-Za-z0-9\-_]+$', result) and len(result) <= 100:
+                return result
+        
+        return None
+    except Exception as e:
+        print(f"Patient ID extraction failed: {e}")
+        return None
+
+def _extract_patient_id(content: str, available_patient_ids: list[str]) -> Optional[str]:
+    """
+    Extract patient ID from content using AI only (no algorithmic pattern matching).
+    Returns: patient ID if found in available list, None otherwise
+    """
+    if not content or not content.strip() or not available_patient_ids:
+        return None
+    
+    # Use AI to extract patient identifier
+    content_preview = content[:3000] if len(content) > 3000 else content
+    
+    prompt = f"""Analyze the following medical document and extract the patient identifier.
+Available patient IDs: {', '.join(available_patient_ids[:10])}
+
+Look for:
+- Patient ID fields
+- Patient identifiers
+- UUIDs that match the format of available patient IDs
+- Any explicit patient ID mentions
+
+Document content:
+{content_preview}
+
+CRITICAL: Respond with ONLY the patient ID exactly as it appears in the available list above. Do not include any explanation, sentence, or additional text.
+- Match the ID exactly (case-sensitive) from the available list
+- If you see "Patient ID: 4567" and 4567 is in the available list, respond with: 4567
+- If you see a UUID that matches one in the available list, respond with that exact UUID
+
+If no matching patient ID is found, respond with exactly: NOT_FOUND"""
+
+    try:
+        model_id = f"anthropic.claude-3-haiku-20240307-v1:0"
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 50,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        result = response_body.get('content', [{}])[0].get('text', '').strip()
+        
+        # Post-process to extract just the ID if AI returned a sentence
+        if result and result != "NOT_FOUND":
+            # Try to extract UUID pattern first
+            uuid_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+            uuid_match = re.search(uuid_pattern, result)
+            if uuid_match:
+                extracted_id = uuid_match.group(0)
+                # Check if it matches any available patient ID
+                for pid in available_patient_ids:
+                    if pid == extracted_id:
+                        return pid
+            
+            # Try to extract after common phrases (handles sentences like "The patient identifier in the document is 4567")
+            patterns = [
+                r'(?:patient\s*(?:id|identifier|ID|Identifier)?\s*(?:in\s+the\s+document\s+)?(?:is|:|=)\s*)([A-Za-z0-9\-_]+)',
+                r'(?:identifier\s*(?:in\s+the\s+document\s+)?(?:is|:|=)\s*)([A-Za-z0-9\-_]+)',
+                r'(?:ID\s*(?:in\s+the\s+document\s+)?(?:is|:|=)\s*)([A-Za-z0-9\-_]+)',
+                r'(?:is\s+)([A-Za-z0-9\-_]+)(?:\s*\.?\s*$)',  # "is 4567." at end
+                r'(?:document\s+is\s+)([A-Za-z0-9\-_]+)',  # "document is 4567"
+                r'(?:is\s+)([A-Za-z0-9\-_]+)(?:\s*\.)',  # "is 4567." anywhere
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, result, re.IGNORECASE)
+                if match:
+                    extracted = match.group(1).strip()
+                    # Remove trailing punctuation
+                    extracted = re.sub(r'[.,;:!?]+$', '', extracted)
+                    # Check if extracted ID matches any available patient ID (case-insensitive)
+                    if extracted:
+                        extracted_lower = extracted.lower()
+                        for pid in available_patient_ids:
+                            if pid.lower() == extracted_lower:
+                                return pid
+            
+            # Check if result itself matches any available patient ID (case-insensitive)
+            result_lower = result.lower()
+            for pid in available_patient_ids:
+                if pid.lower() == result_lower:
+                    return pid
+        
+        return None
+    except Exception as e:
+        print(f"Patient ID extraction failed: {e}")
+        return None
+
+def _extract_date(content: str) -> Optional[str]:
+    """
+    Extract date from content using pattern matching and AI.
+    Returns: date in YYYY-MM-DD format if found, None otherwise
+    """
+    if not content or not content.strip():
+        return None
+    
+    # Try common date patterns first
+    date_patterns = [
+        (r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', '%Y-%m-%d'),  # YYYY-MM-DD
+        (r'\b(\d{1,2})/(\d{1,2})/(\d{4})\b', '%m/%d/%Y'),  # MM/DD/YYYY
+        (r'\b(\d{1,2})-(\d{1,2})-(\d{4})\b', '%m-%d-%Y'),  # MM-DD-YYYY
+        (r'\b(\d{1,2})/(\d{1,2})/(\d{2})\b', '%m/%d/%y'),  # MM/DD/YY
+    ]
+    
+    for pattern, date_format in date_patterns:
+        matches = re.findall(pattern, content)
+        if matches:
+            try:
+                from datetime import datetime
+                match = matches[0]
+                if date_format == '%Y-%m-%d':
+                    date_str = '-'.join(match)
+                    parsed_date = datetime.strptime(date_str, date_format)
+                elif date_format == '%m/%d/%Y':
+                    date_str = '/'.join(match)
+                    parsed_date = datetime.strptime(date_str, date_format)
+                elif date_format == '%m-%d-%Y':
+                    date_str = '-'.join(match)
+                    parsed_date = datetime.strptime(date_str, date_format)
+                elif date_format == '%m/%d/%y':
+                    date_str = '/'.join(match)
+                    # Convert 2-digit year to 4-digit
+                    year = int(match[2])
+                    if year < 50:
+                        year += 2000
+                    else:
+                        year += 1900
+                    date_str = f"{match[0]}/{match[1]}/{year}"
+                    parsed_date = datetime.strptime(date_str, '%m/%d/%Y')
+                else:
+                    continue
+                return parsed_date.strftime('%Y-%m-%d')
+            except Exception as e:
+                continue
+    
+    # If pattern matching fails, use AI
+    content_preview = content[:3000] if len(content) > 3000 else content
+    
+    prompt = f"""Extract the document date from the following medical document.
+Look for dates in formats like YYYY-MM-DD, MM/DD/YYYY, or written dates.
+
+Document content:
+{content_preview}
+
+Respond with ONLY the date in YYYY-MM-DD format, or "NOT_FOUND" if no date is found.
+If multiple dates are found, return the most relevant document date (usually near the top or in a header)."""
+
+    try:
+        model_id = f"anthropic.claude-3-haiku-20240307-v1:0"
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 20,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        result = response_body.get('content', [{}])[0].get('text', '').strip()
+        
+        if result and result != "NOT_FOUND":
+            # Validate date format
+            try:
+                from datetime import datetime
+                parsed = datetime.strptime(result, '%Y-%m-%d')
+                return result
+            except:
+                # Try to extract date from response
+                date_match = re.search(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', result)
+                if date_match:
+                    return result
+        return None
+    except Exception as e:
+        print(f"Date extraction failed: {e}")
+        return None
+
+def _suggest_misc_tags(content: str, num_suggestions: int = 5) -> list[str]:
+    """
+    Generate AI suggestions for miscellaneous tags based on document content.
+    Returns: list of suggested tag strings
+    """
+    if not content or not content.strip():
+        return []
+    
+    content_preview = content[:4000] if len(content) > 4000 else content
+    
+    prompt = f"""Analyze the following medical document and suggest {num_suggestions} relevant tags for categorization.
+Tags should be:
+- Short (1-3 words)
+- Descriptive of key findings, conditions, or document characteristics
+- Useful for filtering and searching
+- Examples: "urgent", "follow-up", "abnormal findings", "routine", "surgical", "biopsy", "pregnancy", "cardiac", etc.
+
+Document content:
+{content_preview}
+
+Respond with ONLY a comma-separated list of {num_suggestions} tags, nothing else.
+Example format: urgent, abnormal findings, cardiac, follow-up, routine"""
+
+    try:
+        model_id = f"anthropic.claude-3-haiku-20240307-v1:0"
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        result = response_body.get('content', [{}])[0].get('text', '').strip()
+        
+        if result:
+            # Parse comma-separated tags
+            tags = [tag.strip() for tag in result.split(',') if tag.strip()]
+            return tags[:num_suggestions]  # Limit to requested number
+        
+        return []
+    except Exception as e:
+        print(f"Tag suggestion failed: {e}")
+        return []
+
+def _extract_document_type(content: str) -> str:
+    """
+    Extract document type from content using Amazon Bedrock (prompt-based).
+    Returns: 'ultrasound', 'pathology', or 'other'
+    """
+    if not content or not content.strip():
+        return "other"
+    
+    # Truncate content if too long (keep first 5000 chars for prompt)
+    content_preview = content[:5000] if len(content) > 5000 else content
+    
+    prompt = f"""Analyze the following medical document content and classify it as one of these types:
+- ultrasound: If the document contains ultrasound imaging reports, sonography findings, or related terminology
+- pathology: If the document contains pathology reports, biopsy results, histology findings, or laboratory analysis
+- other: If the document does not clearly fit into ultrasound or pathology categories
+
+Document content:
+{content_preview}
+
+Respond with ONLY one word: 'ultrasound', 'pathology', or 'other'."""
+
+    try:
+        # Use Claude model for classification
+        model_id = f"anthropic.claude-3-haiku-20240307-v1:0"
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 10,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            })
+        )
+        
+        response_body = json.loads(response['body'].read())
+        result = response_body.get('content', [{}])[0].get('text', 'other').strip().lower()
+        
+        # Validate result
+        if result in ['ultrasound', 'pathology', 'other']:
+            return result
+        else:
+            return "other"
+    except Exception as e:
+        print(f"Document type extraction failed: {e}. Defaulting to 'other'.")
+        return "other"
+
+
+
+# =========================
+# UI Callbacks
+# =========================
+def auto_detect_note_callback():
+    """Callback for auto-detecting tags from manual note content"""
+    # Get content from text area widget using its key
+    typed_content = st.session_state.get("note_text_area", "")
+    if not typed_content or not typed_content.strip():
+        return
+    
+    patient_ids = st.session_state.get("available_patient_ids", [])
+    
+    # Store content hash to detect changes
+    import hashlib
+    content_hash = hashlib.md5(typed_content.encode()).hexdigest()
+    st.session_state.note_last_detected_content_hash = content_hash
+    
+    # First try to find patient ID in available list
+    detected_patient = _extract_patient_id(typed_content, patient_ids)
+    if detected_patient:
+        st.session_state.note_tag_patient_id = detected_patient
+    else:
+        # Try to extract any patient ID (even if not in list)
+        any_patient_id = _extract_any_patient_id(typed_content)
+        if any_patient_id:
+            # Check if it's a new patient - only exact match (case-insensitive)
+            matched = False
+            for pid in patient_ids:
+                if any_patient_id.lower() == pid.lower():
+                    st.session_state.note_tag_patient_id = pid
+                    matched = True
+                    break
+            
+            if not matched:
+                # It's a new patient
+                st.session_state.note_detected_new_patient_id = any_patient_id
+                st.session_state.note_show_new_patient_confirmation = True
+    
+    # Detect date
+    detected_date = _extract_date(typed_content)
+    if detected_date:
+        from datetime import datetime
+        date_obj = datetime.strptime(detected_date, '%Y-%m-%d').date()
+        st.session_state.note_tag_date = date_obj
+        st.session_state.note_tag_date_input = date_obj
+    
+    # Detect document type
+    detected_type = _extract_document_type(typed_content)
+    st.session_state.note_tag_document_type = detected_type
+    
+    # Suggest misc tags
+    suggested_tags = _suggest_misc_tags(typed_content, num_suggestions=5)
+    if suggested_tags:
+        st.session_state.note_suggested_tags = suggested_tags
+        st.session_state.note_show_suggestions = True
+    
+    # Mark that auto-detect was just run
+    st.session_state.note_auto_detect_just_ran = True
+
+def auto_detect_upload_callback():
+    """Callback for auto-detecting tags from uploaded file content"""
+    uploaded_files = st.session_state.get("uploaded_files_for_detection", [])
+    if not uploaded_files:
+        return
+    
+    first_file = uploaded_files[0]
+    patient_ids = st.session_state.get("available_patient_ids", [])
+    
+    try:
+        file_bytes = first_file.read()
+        content = file_bytes.decode('utf-8', errors='ignore')
+        first_file.seek(0)  # Reset file pointer
+        
+        # Store content hash to detect changes
+        import hashlib
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        st.session_state.upload_last_detected_content_hash = content_hash
+        
+        # First try to find patient ID in available list
+        detected_patient = _extract_patient_id(content, patient_ids)
+        if detected_patient:
+            st.session_state.upload_tag_patient_id = detected_patient
+        else:
+            # Try to extract any patient ID (even if not in list)
+            any_patient_id = _extract_any_patient_id(content)
+            if any_patient_id:
+                # Check if it's a new patient - only exact match (case-insensitive)
+                matched = False
+                for pid in patient_ids:
+                    if any_patient_id.lower() == pid.lower():
+                        st.session_state.upload_tag_patient_id = pid
+                        matched = True
+                        break
+                
+                if not matched:
+                    # It's a new patient
+                    st.session_state.upload_detected_new_patient_id = any_patient_id
+                    st.session_state.upload_show_new_patient_confirmation = True
+        
+        # Detect date
+        detected_date = _extract_date(content)
+        if detected_date:
+            from datetime import datetime
+            date_obj = datetime.strptime(detected_date, '%Y-%m-%d').date()
+            st.session_state.upload_tag_date = date_obj
+            st.session_state.upload_tag_date_input = date_obj
+        
+        # Detect document type
+        detected_type = _extract_document_type(content)
+        st.session_state.upload_tag_document_type = detected_type
+        
+        # Suggest misc tags
+        suggested_tags = _suggest_misc_tags(content, num_suggestions=5)
+        if suggested_tags:
+            st.session_state.upload_suggested_tags = suggested_tags
+            st.session_state.upload_show_suggestions = True
+        
+        # Mark that auto-detect was just run
+        st.session_state.upload_auto_detect_just_ran = True
+    except Exception as e:
+        st.session_state.upload_detection_error = str(e)
 
 # =========================
 # UI
@@ -367,13 +1117,6 @@ with st.sidebar:
 
     st.markdown("## Clinician ID")
     st.text(sub or "(unknown)")
-
-    # Patient picker
-    selected_patient = st.selectbox(
-        "Select a patient (or 'All' for all patients)",
-        ['All'] + patient_ids,
-        key="patient_select"
-    )
 
     st.divider()
 
@@ -410,24 +1153,91 @@ with st.sidebar:
 
 st.header("Secluded DataDissect environment")
 
-# --- KB status pill (always visible) ---
-try:
-    _ds_id, _bucket = _get_kb_data_source(kb_id)
-    status, last_job_id, started = _latest_ingestion_status(kb_id, _ds_id)
-    color = {"COMPLETE": "#16a34a", "IN_PROGRESS": "#f59e0b", "FAILED": "#dc2626", "NO_JOBS": "#6b7280"}.get(status, "#6b7280")
-    st.markdown(
-        f"<div style='display:inline-block;padding:3px 10px;border-radius:999px;background:{color};color:white;font-weight:600;'>"
-        f"KB status: {status.replace('_',' ')}"
-        f"{' • job '+last_job_id if last_job_id else ''}</div>",
-        unsafe_allow_html=True
-    )
-    if st.button("Refresh KB status"):
-        st.rerun()
-except Exception as e:
-    st.info(f"KB status unavailable: {e}")
-
 # --- Unified search (text + inline mic) ---
 st.subheader("Search")
+
+# Initialize search filter session state
+if "search_filter_logic" not in st.session_state:
+    st.session_state.search_filter_logic = True  # AND by default
+if "search_patient_ids" not in st.session_state:
+    st.session_state.search_patient_ids = []
+if "search_doc_types" not in st.session_state:
+    st.session_state.search_doc_types = []
+if "search_misc_tags" not in st.session_state:
+    st.session_state.search_misc_tags = []
+
+# Render search filter pills
+st.markdown("**Filter search results:**")
+st.markdown('<div class="pill-container">', unsafe_allow_html=True)
+
+col_slogic, col_sdiv1, col_spatient, col_sdoctype, col_smisc = st.columns([1, 0.1, 2, 2, 2])
+
+with col_slogic:
+    # Use selectbox to match structure of other filters and allow toggle
+    options = ["AND", "OR"]
+    
+    # Initialize selectbox value in session state if needed
+    if "search_filter_logic_select" not in st.session_state:
+        st.session_state.search_filter_logic_select = "AND" if st.session_state.search_filter_logic else "OR"
+    
+    # Let Streamlit manage the widget state via key
+    selected_logic = st.selectbox(
+        "Logic",
+        options,
+        key="search_filter_logic_select",
+        label_visibility="visible"
+    )
+    # Sync the boolean logic state with the selectbox value
+    st.session_state.search_filter_logic = (selected_logic == "AND")
+
+with col_sdiv1:
+    st.markdown('<span class="pill-divider"></span>', unsafe_allow_html=True)
+
+with col_spatient:
+    selected_search_patients = st.multiselect(
+        "Patient IDs",
+        patient_ids,
+        default=st.session_state.search_patient_ids,
+        key="search_patient_multiselect",
+        label_visibility="visible"
+    )
+    st.session_state.search_patient_ids = selected_search_patients
+    if selected_search_patients:
+        display_text = f"👤 {len(selected_search_patients)} patient(s)"
+        st.markdown(f'<span class="pill pill-patient">{display_text}</span>', unsafe_allow_html=True)
+
+with col_sdoctype:
+    selected_doc_types = st.multiselect(
+        "Document Types",
+        ["ultrasound", "pathology", "other"],
+        default=st.session_state.search_doc_types,
+        key="search_doc_type_multiselect",
+        label_visibility="visible"
+    )
+    st.session_state.search_doc_types = selected_doc_types
+    if selected_doc_types:
+        display_text = f"📄 {', '.join(selected_doc_types)}"
+        st.markdown(f'<span class="pill pill-doc-type">{display_text}</span>', unsafe_allow_html=True)
+
+with col_smisc:
+    misc_input = st.text_input(
+        "Misc Tags",
+        value=", ".join(st.session_state.search_misc_tags),
+        key="search_misc_input",
+        help="Comma-separated tags",
+        label_visibility="visible"
+    )
+    if misc_input:
+        st.session_state.search_misc_tags = [tag.strip() for tag in misc_input.split(",") if tag.strip()]
+    else:
+        st.session_state.search_misc_tags = []
+    if st.session_state.search_misc_tags:
+        display_text = f"🏷️ {', '.join(st.session_state.search_misc_tags[:2])}"
+        if len(st.session_state.search_misc_tags) > 2:
+            display_text += f" (+{len(st.session_state.search_misc_tags) - 2})"
+        st.markdown(f'<span class="pill pill-misc">{display_text}</span>', unsafe_allow_html=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
 
 # init keys once
 st.session_state.setdefault("query_text_input", "")
@@ -504,9 +1314,28 @@ if do_search:
 if st.session_state.get("run_q"):
     run_q = st.session_state["run_q"]
     st.session_state["run_q"] = None
-    patient_ids_filter = [selected_patient] if selected_patient != 'All' else patient_ids
+    
+    # Build filter parameters from search pills
+    # Use search pills if any are selected, otherwise use all patients
+    if st.session_state.search_patient_ids:
+        patient_ids_filter = st.session_state.search_patient_ids
+    else:
+        patient_ids_filter = patient_ids
+    
+    # Only create filter_params if there are any filters beyond patient_id
+    filter_params = None
+    if (st.session_state.search_doc_types or 
+        st.session_state.search_misc_tags or 
+        st.session_state.search_patient_ids):  # If using search pills for patients
+        filter_params = {
+            "filter_logic": "AND" if st.session_state.search_filter_logic else "OR",
+            "patient_ids": patient_ids_filter,
+            "document_types": st.session_state.search_doc_types,
+            "miscellaneous_tags": st.session_state.search_misc_tags
+        }
+    
     with st.spinner("Searching KB…"):
-        out = search_transcript(sub, kb_id, run_q, patient_ids_filter)
+        out = search_transcript(sub, kb_id, run_q, patient_ids_filter, filter_params)
     st.session_state["last_results"] = out
     st.rerun()
 
@@ -526,7 +1355,27 @@ if st.session_state.get("last_results"):
 st.markdown("<div style='height:100px;'></div>", unsafe_allow_html=True)
 st.divider()
 # --- Add to knowledge base (renamed & simplified) ---
-st.subheader("Add to knowledge base")
+# Get KB status for the dot indicator
+kb_status_color = "#6b7280"  # default gray
+kb_status_text = "Unknown"
+try:
+    _ds_id, _bucket = _get_kb_data_source(kb_id)
+    status, last_job_id, started = _latest_ingestion_status(kb_id, _ds_id)
+    kb_status_color = {"COMPLETE": "#16a34a", "IN_PROGRESS": "#f59e0b", "FAILED": "#dc2626", "NO_JOBS": "#6b7280"}.get(status, "#6b7280")
+    kb_status_text = f"{status.replace('_',' ')}{' • job '+last_job_id if last_job_id else ''}"
+except Exception as e:
+    kb_status_text = f"Status unavailable: {e}"
+
+# Create header with status-colored dot and redo button
+col_header1, col_header2, col_header3 = st.columns([0.05, 0.9, 0.05])
+with col_header1:
+    st.markdown(f'<div style="width:8px;height:8px;border-radius:50%;background:{kb_status_color};border:1px solid rgba(0,0,0,0.1);margin-top:8px;" title="{kb_status_text}"></div>', unsafe_allow_html=True)
+with col_header2:
+    st.subheader("Add to knowledge base")
+with col_header3:
+    if st.button("↻", help=f"KB: {kb_status_text}", key="kb_refresh_btn", use_container_width=True):
+        st.toast(f"KB status: {kb_status_text}", icon="ℹ️")
+        st.rerun()
 
 uploaded_files = st.file_uploader(
     "Choose files",
@@ -543,8 +1392,111 @@ with c_opt:
 typed_content = st.text_area(
     label="",
     height=220,
-    placeholder="Write a quick note (Markdown supported)…"
+    placeholder="Write a quick note (Markdown supported)…",
+    key="note_text_area"
 )
+
+# Render tagging pills (using "note" prefix for manual notes)
+tags = _render_tagging_pills(patient_ids, None, key_prefix="note")
+
+# Auto-detect all tags if content is provided
+if typed_content.strip():
+    # Store patient_ids in session state for callback (content is already in session state via widget key)
+    st.session_state.available_patient_ids = patient_ids
+    
+    # Check if content has changed since last detection
+    import hashlib
+    current_content_hash = hashlib.md5(typed_content.encode()).hexdigest()
+    last_detected_hash = st.session_state.get("note_last_detected_content_hash")
+    
+    # Clear detection results if content has changed
+    if last_detected_hash and current_content_hash != last_detected_hash:
+        st.session_state.note_auto_detect_just_ran = False
+        st.session_state.note_show_suggestions = False
+        st.session_state.note_show_new_patient_confirmation = False
+    
+    col_auto1, col_auto2 = st.columns([2, 1])
+    with col_auto1:
+        st.markdown("**AI Auto-Detection:**")
+    with col_auto2:
+        st.button(
+            "🔍 Auto-detect All", 
+            key="btn_auto_detect_all_note", 
+            help="Auto-detect patient ID, date, document type, and suggest tags", 
+            use_container_width=True, 
+            type="secondary",
+            on_click=auto_detect_note_callback
+        )
+    
+    # Show new patient confirmation if detected
+    if st.session_state.get("note_show_new_patient_confirmation"):
+        new_patient_id = st.session_state.get("note_detected_new_patient_id")
+        if new_patient_id:
+            st.warning(f"⚠️ **New Patient Detected:** `{new_patient_id}`")
+            st.info("This patient ID was found in the document but is not in your patient list. Registering this patient will add them to your list and allow you to upload the document.")
+            col_confirm1, col_confirm2 = st.columns([1, 1])
+            with col_confirm1:
+                if st.button("Register & Continue", key="note_confirm_new_patient", type="primary", use_container_width=True):
+                    try:
+                        res = add_patient_to_doctor(dynamo_table, sub, new_patient_id)
+                        if res == "exists":
+                            st.info(f"Patient {new_patient_id} is already assigned to this Clinician.")
+                        else:
+                            st.success(f"Patient {new_patient_id} registered successfully.")
+                        # Update session state
+                        st.session_state.note_tag_patient_id = new_patient_id
+                        st.session_state.note_show_new_patient_confirmation = False
+                        st.session_state.note_detected_new_patient_id = None
+                        # Refresh patient_ids list
+                        st.session_state.available_patient_ids = get_patient_ids(sub)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to register patient: {e}")
+            with col_confirm2:
+                if st.button("Cancel", key="note_cancel_new_patient", use_container_width=True):
+                    st.session_state.note_show_new_patient_confirmation = False
+                    st.session_state.note_detected_new_patient_id = None
+                    st.rerun()
+            st.divider()
+    
+    # Show detection results ONLY if auto-detect was just run and content matches
+    if st.session_state.get("note_auto_detect_just_ran") and current_content_hash == st.session_state.get("note_last_detected_content_hash"):
+        results = []
+        if st.session_state.get("note_tag_patient_id"):
+            pid = st.session_state.note_tag_patient_id
+            results.append(f"Patient ID: {pid[:20]}...")
+        if st.session_state.get("note_tag_date"):
+            date = st.session_state.note_tag_date
+            results.append(f"Date: {date}")
+        if st.session_state.get("note_tag_document_type") != "other":
+            results.append(f"Document Type: {st.session_state.note_tag_document_type}")
+        if st.session_state.get("note_suggested_tags"):
+            results.append(f"Suggested {len(st.session_state.note_suggested_tags)} tags")
+        
+        if results:
+            st.success(" | ".join(results))
+    
+    # Show suggested tags if available
+    if st.session_state.get("note_show_suggestions") and st.session_state.get("note_suggested_tags"):
+        st.markdown("**💡 Suggested Tags (click to add):**")
+        suggested = st.session_state.note_suggested_tags
+        current_tags = set(st.session_state.note_tag_misc)
+        
+        # Create columns for tag buttons
+        cols = st.columns(min(5, len(suggested)))
+        for idx, tag in enumerate(suggested):
+            with cols[idx % len(cols)]:
+                if tag not in current_tags:
+                    if st.button(f"➕ {tag}", key=f"add_tag_note_{idx}", use_container_width=True):
+                        st.session_state.note_tag_misc.append(tag)
+                        st.rerun()
+                else:
+                    st.button(f"✓ {tag}", key=f"added_tag_note_{idx}", use_container_width=True, disabled=True)
+        
+        if st.button("Clear suggestions", key="clear_suggestions_note"):
+            st.session_state.note_show_suggestions = False
+            st.session_state.note_suggested_tags = []
+            st.rerun()
 
 col_btn1, col_btn2 = st.columns([1, 1])
 with col_btn1:
@@ -560,21 +1512,50 @@ st.divider()
 
 # Manual note save (auto filename)
 if save_btn:
-    if selected_patient == "All":
-        st.warning("Please select a single patient in the sidebar first.")
+    if not tags["patient_id"]:
+        st.warning("Please select a patient ID in the tagging pills above.")
     elif not typed_content.strip():
         st.warning("The note is empty.")
     else:
+        # Check if patient ID is in the list, if not, try to add it
+        selected_patient_id = tags["patient_id"]
+        current_patient_ids = get_patient_ids(sub)
+        if selected_patient_id.lower() not in [pid.lower() for pid in current_patient_ids]:
+            # Patient not in list - try to add it
+            try:
+                res = add_patient_to_doctor(dynamo_table, sub, selected_patient_id)
+                if res == "exists":
+                    st.info(f"Patient {selected_patient_id} is already assigned to this Clinician.")
+                else:
+                    st.success(f"Patient {selected_patient_id} registered successfully.")
+                # Refresh patient_ids list
+                patient_ids = get_patient_ids(sub)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to register patient: {e}")
+                st.stop()
+        
         try:
             data_source_id, bucket = _get_kb_data_source(kb_id)
             file_bytes = typed_content.encode("utf-8")
             auto_name = f"note-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.md"
+            
+            # Auto-detect document type if still "other" and content exists
+            doc_type = tags["document_type"]
+            if doc_type == "other" and typed_content.strip():
+                with st.spinner("Auto-detecting document type..."):
+                    doc_type = _extract_document_type(typed_content)
+                    # Update session state so UI reflects the detected type
+                    st.session_state.note_tag_document_type = doc_type
 
             stored_key, meta_key = _put_file_and_metadata(
                 bucket=bucket,
                 filename=auto_name,
                 file_bytes=file_bytes,
-                patient_id=selected_patient
+                patient_id=tags["patient_id"],
+                document_type=doc_type,
+                date=tags["date"],
+                miscellaneous_tags=tags["miscellaneous_tags"] if tags["miscellaneous_tags"] else None
             )
             st.success(f"Saved `{auto_name}` as `s3://{bucket}/{stored_key}` (metadata: `{meta_key}`).")
 
@@ -584,7 +1565,135 @@ if save_btn:
         except Exception as e:
             st.error(f"Failed to save or ingest note: {e}")
 
-# Upload files area
+# Upload files area - render tagging pills for file uploads
+upload_tags = None
+if uploaded_files:
+    st.markdown("**Tag files before uploading:**")
+    upload_tags = _render_tagging_pills(patient_ids, None, key_prefix="upload")
+    
+    # Auto-detect all tags for uploaded files
+    # Show button if we have text-based files
+    first_file = uploaded_files[0]
+    can_auto_detect = first_file.name.lower().endswith(('.txt', '.md'))
+    
+    if can_auto_detect:
+        # Store file and patient_ids in session state for callback
+        st.session_state.uploaded_files_for_detection = uploaded_files
+        st.session_state.available_patient_ids = patient_ids
+        
+        # Check if file content has changed since last detection
+        try:
+            first_file.seek(0)
+            file_bytes = first_file.read()
+            content = file_bytes.decode('utf-8', errors='ignore')
+            first_file.seek(0)  # Reset for later use
+            
+            import hashlib
+            current_content_hash = hashlib.md5(content.encode()).hexdigest()
+            last_detected_hash = st.session_state.get("upload_last_detected_content_hash")
+            
+            # Clear detection results if content has changed
+            if last_detected_hash and current_content_hash != last_detected_hash:
+                st.session_state.upload_auto_detect_just_ran = False
+                st.session_state.upload_show_suggestions = False
+                st.session_state.upload_show_new_patient_confirmation = False
+        except:
+            current_content_hash = None
+            last_detected_hash = None
+        
+        st.markdown("---")
+        col_auto1, col_auto2 = st.columns([2, 1])
+        with col_auto1:
+            st.markdown("**AI Auto-Detection:**")
+        with col_auto2:
+            st.button(
+                "🔍 Auto-detect All", 
+                key="btn_auto_detect_all_upload", 
+                help="Auto-detect patient ID, date, document type, and suggest tags", 
+                use_container_width=True, 
+                type="secondary",
+                on_click=auto_detect_upload_callback
+            )
+        
+        # Show detection error if any
+        if st.session_state.get("upload_detection_error"):
+            st.error(f"Failed to read file for auto-detection: {st.session_state.upload_detection_error}")
+            st.session_state.upload_detection_error = None
+        
+        # Show new patient confirmation if detected
+        if st.session_state.get("upload_show_new_patient_confirmation"):
+            new_patient_id = st.session_state.get("upload_detected_new_patient_id")
+            if new_patient_id:
+                st.warning(f"⚠️ **New Patient Detected:** `{new_patient_id}`")
+                st.info("This patient ID was found in the document but is not in your patient list. Registering this patient will add them to your list and allow you to upload the document.")
+                col_confirm1, col_confirm2 = st.columns([1, 1])
+                with col_confirm1:
+                    if st.button("Register & Continue", key="upload_confirm_new_patient", type="primary", use_container_width=True):
+                        try:
+                            res = add_patient_to_doctor(dynamo_table, sub, new_patient_id)
+                            if res == "exists":
+                                st.info(f"Patient {new_patient_id} is already assigned to this Clinician.")
+                            else:
+                                st.success(f"Patient {new_patient_id} registered successfully.")
+                            # Update session state
+                            st.session_state.upload_tag_patient_id = new_patient_id
+                            st.session_state.upload_show_new_patient_confirmation = False
+                            st.session_state.upload_detected_new_patient_id = None
+                            # Refresh patient_ids list
+                            st.session_state.available_patient_ids = get_patient_ids(sub)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to register patient: {e}")
+                with col_confirm2:
+                    if st.button("Cancel", key="upload_cancel_new_patient", use_container_width=True):
+                        st.session_state.upload_show_new_patient_confirmation = False
+                        st.session_state.upload_detected_new_patient_id = None
+                        st.rerun()
+                st.divider()
+        
+        # Show detection results ONLY if auto-detect was just run and content matches
+        if (st.session_state.get("upload_auto_detect_just_ran") and 
+            current_content_hash and 
+            current_content_hash == st.session_state.get("upload_last_detected_content_hash")):
+            results = []
+            if st.session_state.get("upload_tag_patient_id"):
+                pid = st.session_state.upload_tag_patient_id
+                results.append(f"Patient ID: {pid[:20]}...")
+            if st.session_state.get("upload_tag_date"):
+                date = st.session_state.upload_tag_date
+                results.append(f"Date: {date}")
+            if st.session_state.get("upload_tag_document_type") != "other":
+                results.append(f"Document Type: {st.session_state.upload_tag_document_type}")
+            if st.session_state.get("upload_suggested_tags"):
+                results.append(f"Suggested {len(st.session_state.upload_suggested_tags)} tags")
+            
+            if results:
+                st.success(" | ".join(results))
+        
+        # Show suggested tags if available
+        if st.session_state.get("upload_show_suggestions") and st.session_state.get("upload_suggested_tags"):
+            st.markdown("**💡 Suggested Tags (click to add):**")
+            suggested = st.session_state.upload_suggested_tags
+            current_tags = set(st.session_state.upload_tag_misc)
+            
+            # Create columns for tag buttons
+            cols = st.columns(min(5, len(suggested)))
+            for idx, tag in enumerate(suggested):
+                with cols[idx % len(cols)]:
+                    if tag not in current_tags:
+                        if st.button(f"➕ {tag}", key=f"add_tag_upload_{idx}", use_container_width=True):
+                            st.session_state.upload_tag_misc.append(tag)
+                            st.rerun()
+                    else:
+                        st.button(f"✓ {tag}", key=f"added_tag_upload_{idx}", use_container_width=True, disabled=True)
+            
+            if st.button("Clear suggestions", key="clear_suggestions_upload"):
+                st.session_state.upload_show_suggestions = False
+                st.session_state.upload_suggested_tags = []
+                st.rerun()
+        
+        st.markdown("---")
+
 col1, col2 = st.columns([1, 1])
 with col1:
     do_ingest = st.button("Upload & Start Ingestion", type="primary")
@@ -592,17 +1701,69 @@ with col2:
     just_upload = st.button("Upload Only")
 
 if (do_ingest or just_upload):
-    if selected_patient == "All":
-        st.warning("Please select a single patient in the sidebar before uploading, so we can stamp the correct patient_id in metadata.")
+    if not upload_tags or not upload_tags.get("patient_id"):
+        st.warning("Please select a patient ID in the tagging pills above.")
     elif not uploaded_files:
         st.warning("Please pick at least one file.")
     else:
+        # Check if patient ID is in the list, if not, try to add it
+        selected_patient_id = upload_tags.get("patient_id")
+        current_patient_ids = get_patient_ids(sub)
+        if selected_patient_id and selected_patient_id.lower() not in [pid.lower() for pid in current_patient_ids]:
+            # Patient not in list - try to add it
+            try:
+                res = add_patient_to_doctor(dynamo_table, sub, selected_patient_id)
+                if res == "exists":
+                    st.info(f"Patient {selected_patient_id} is already assigned to this Clinician.")
+                else:
+                    st.success(f"Patient {selected_patient_id} registered successfully.")
+                # Refresh patient_ids list
+                patient_ids = get_patient_ids(sub)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to register patient: {e}")
+                st.stop()
+        
         try:
             data_source_id, bucket = _get_kb_data_source(kb_id)
             uploaded = []
             for f in uploaded_files:
                 key = f.name  # keep original filename
-                _k, _meta_key = _put_file_and_metadata(bucket, key, f.read(), selected_patient)
+                file_bytes = f.read()
+                
+                # Use the document type from tags (which may have been auto-detected)
+                doc_type = upload_tags["document_type"]
+                
+                # If still "other", try to auto-detect during upload (but don't update UI at this point)
+                if doc_type == "other":
+                    # Try to read text from file for document type detection
+                    try:
+                        if key.lower().endswith('.txt') or key.lower().endswith('.md'):
+                            content = file_bytes.decode('utf-8', errors='ignore')
+                            with st.spinner(f"Auto-detecting type for {key}..."):
+                                doc_type = _extract_document_type(content)
+                                # Update session state so UI reflects the detected type
+                                st.session_state.upload_tag_document_type = doc_type
+                        elif key.lower().endswith('.pdf'):
+                            # For PDF, we'd need pdf parsing, but for now default to other
+                            # In production, you might want to use PyPDF2 or similar
+                            pass
+                    except Exception:
+                        pass  # Keep as "other" if extraction fails
+                
+                # Reset file pointer for upload
+                f.seek(0)
+                file_bytes = f.read()
+                
+                _k, _meta_key = _put_file_and_metadata(
+                    bucket=bucket,
+                    filename=key,
+                    file_bytes=file_bytes,
+                    patient_id=upload_tags["patient_id"],
+                    document_type=doc_type,
+                    date=upload_tags["date"],
+                    miscellaneous_tags=upload_tags["miscellaneous_tags"] if upload_tags["miscellaneous_tags"] else None
+                )
                 uploaded.append((key, _meta_key))
             st.success(f"Uploaded {len(uploaded)} file(s) to s3://{bucket}/ (with metadata).")
 
