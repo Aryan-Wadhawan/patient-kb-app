@@ -1,6 +1,7 @@
 import json
 import re
 import mimetypes
+import html
 from uuid import uuid4
 from datetime import datetime
 from typing import Optional, Union
@@ -41,6 +42,50 @@ st.markdown("""
 .pill-misc:hover { background: #7c3aed; border-color: #7c3aed; }
 .pill-divider { width: 2px; height: 24px; background: #e5e7eb; margin: 0 0.25rem; }
 .pill-expanded { margin-top: 0.5rem; padding: 0.75rem; background: #f9fafb; border-radius: 8px; border: 1px solid #e5e7eb; }
+.tag-buttons-container { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.tag-row { display: flex !important; flex-direction: row !important; flex-wrap: wrap; gap: 0.25rem; }
+.tag-row > * { flex: 0 0 auto !important; }
+
+/* Chat styling */
+.chat-container { 
+    height: 500px; 
+    overflow-y: auto; 
+    padding: 1rem; 
+    background: #f9fafb; 
+    border-radius: 8px; 
+    border: 1px solid #e5e7eb;
+    margin-bottom: 1rem;
+}
+.chat-message { 
+    margin-bottom: 1rem; 
+    display: flex; 
+    align-items: flex-start;
+}
+.chat-message.user { justify-content: flex-end; }
+.chat-message.assistant { justify-content: flex-start; }
+.chat-bubble { 
+    max-width: 70%; 
+    padding: 0.75rem 1rem; 
+    border-radius: 12px; 
+    word-wrap: break-word;
+}
+.chat-bubble.user { 
+    background: #3b82f6; 
+    color: white; 
+    border-bottom-right-radius: 4px;
+}
+.chat-bubble.assistant { 
+    background: white; 
+    color: #1f2937; 
+    border: 1px solid #e5e7eb;
+    border-bottom-left-radius: 4px;
+}
+.chat-timestamp {
+    font-size: 0.75rem;
+    color: #6b7280;
+    margin-top: 0.25rem;
+    padding: 0 0.5rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -264,9 +309,9 @@ def _construct_metadata_filter(filter_params: dict) -> dict:
     else:
         return {"orAll": filters}
 
-def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[str], filter_params: dict = None):
+def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[str], filter_params: dict = None, session_id: str = None):
     """
-    Search knowledge base with optional metadata filtering.
+    Search knowledge base with optional metadata filtering and Bedrock session support.
     
     Args:
         doctor_id: Doctor ID
@@ -278,6 +323,10 @@ def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[s
             - patient_ids: List of patient IDs (can override the patient_ids param)
             - document_types: List of document types
             - miscellaneous_tags: List of miscellaneous tags
+        session_id: Optional Bedrock session ID for conversation context (from previous response)
+    
+    Returns:
+        dict with "body" (response text), "error" (if any), and "sessionId" (for next request)
     """
     # Use filter_params patient_ids if provided, otherwise use the param
     final_patient_ids = filter_params.get("patient_ids", patient_ids) if filter_params else patient_ids
@@ -294,6 +343,10 @@ def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[s
         "patientIds": final_patient_ids,
         "metadataFilter": metadata_filter
     }
+    
+    # Add sessionId if provided (for subsequent requests in the same conversation)
+    if session_id:
+        payload["sessionId"] = session_id
 
     try:
         resp = lambda_client.invoke(
@@ -311,31 +364,51 @@ def search_transcript(doctor_id: str, kb_id: str, text: str, patient_ids: list[s
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return {"body": raw}
+            # If response is not JSON, return as plain text (legacy format)
+            return {"body": raw, "sessionId": None}
 
+        result = {"body": None, "sessionId": None}
+        
         if isinstance(data, dict):
             if "body" in data:
                 body = data["body"]
                 try:
                     body_json = json.loads(body)
                     if isinstance(body_json, dict):
-                        if "html" in body_json:
-                            return {"body": body_json["html"]}
-                        if "message" in body_json:
-                            return {"body": body_json["message"]}
-                        return {"body": "<pre>" + json.dumps(body_json, indent=2) + "</pre>"}
+                        # New format: {"text": "...", "sessionId": "..."}
+                        if "text" in body_json and "sessionId" in body_json:
+                            result["body"] = body_json["text"]
+                            result["sessionId"] = body_json["sessionId"]
+                        # Legacy formats for backward compatibility
+                        elif "html" in body_json:
+                            result["body"] = body_json["html"]
+                            if "sessionId" in body_json:
+                                result["sessionId"] = body_json["sessionId"]
+                        elif "message" in body_json:
+                            result["body"] = body_json["message"]
+                            if "sessionId" in body_json:
+                                result["sessionId"] = body_json["sessionId"]
+                        else:
+                            result["body"] = "<pre>" + json.dumps(body_json, indent=2) + "</pre>"
+                            if "sessionId" in body_json:
+                                result["sessionId"] = body_json["sessionId"]
                     else:
-                        return {"body": str(body_json)}
+                        result["body"] = str(body_json)
                 except Exception:
-                    return {"body": body}
-            if "html" in data:
-                return {"body": data["html"]}
-            if "results" in data:
-                return {"body": "<pre>" + json.dumps(data["results"], indent=2) + "</pre>"}
-            if "error" in data:
+                    # If body is not JSON, treat as plain text
+                    result["body"] = body
+            elif "html" in data:
+                result["body"] = data["html"]
+            elif "results" in data:
+                result["body"] = "<pre>" + json.dumps(data["results"], indent=2) + "</pre>"
+            elif "error" in data:
                 return {"error": data["error"]}
-
-        return {"body": "<pre>" + json.dumps(data, indent=2) + "</pre>"}
+            else:
+                result["body"] = "<pre>" + json.dumps(data, indent=2) + "</pre>"
+        else:
+            result["body"] = "<pre>" + json.dumps(data, indent=2) + "</pre>"
+        
+        return result
 
     except Exception as e:
         return {"error": str(e)}
@@ -494,11 +567,11 @@ def _render_tagging_pills(patient_ids: list, default_patient: str = None, key_pr
     misc_key = f"{key_prefix}_tag_misc"
     
     if patient_key not in st.session_state:
-        st.session_state[patient_key] = default_patient if default_patient and default_patient != "All" else (patient_ids[0] if patient_ids else None)
+        st.session_state[patient_key] = default_patient if default_patient and default_patient != "All" else None
     if doc_type_key not in st.session_state:
-        st.session_state[doc_type_key] = "other"
+        st.session_state[doc_type_key] = None
     if date_key not in st.session_state:
-        st.session_state[date_key] = datetime.utcnow().date()
+        st.session_state[date_key] = None
     if misc_key not in st.session_state:
         st.session_state[misc_key] = []
     
@@ -513,33 +586,48 @@ def _render_tagging_pills(patient_ids: list, default_patient: str = None, key_pr
         display_patient = st.session_state[patient_key][:15] + "..." if st.session_state[patient_key] and len(st.session_state[patient_key]) > 15 else (st.session_state[patient_key] or "Select")
         st.markdown(f'<span class="pill pill-patient">👤 {display_patient}</span>', unsafe_allow_html=True)
         with st.expander("👤 Patient", expanded=False):
+            # Add "None" option at the beginning
+            patient_options = [None] + patient_ids if patient_ids else [None]
+            current_index = 0
+            if st.session_state[patient_key] and st.session_state[patient_key] in patient_ids:
+                current_index = patient_ids.index(st.session_state[patient_key]) + 1
+            
             selected_patient = st.selectbox(
                 "Select Patient",
-                patient_ids,
-                index=patient_ids.index(st.session_state[patient_key]) if st.session_state[patient_key] in patient_ids else 0,
+                patient_options,
+                index=current_index,
                 key=f"{key_prefix}_select_tag_patient",
-                label_visibility="visible"
+                label_visibility="visible",
+                format_func=lambda x: "Select..." if x is None else x
             )
             st.session_state[patient_key] = selected_patient
     
     with col_doc:
-        st.markdown(f'<span class="pill pill-doc-type">📄 {st.session_state[doc_type_key]}</span>', unsafe_allow_html=True)
+        doc_display = st.session_state[doc_type_key] if st.session_state[doc_type_key] else "Select"
+        st.markdown(f'<span class="pill pill-doc-type">📄 {doc_display}</span>', unsafe_allow_html=True)
         with st.expander("📄 Doc Type", expanded=False):
+            doc_options = [None, "ultrasound", "pathology", "other"]
+            current_index = 0
+            if st.session_state[doc_type_key] in ["ultrasound", "pathology", "other"]:
+                current_index = doc_options.index(st.session_state[doc_type_key])
+            
             doc_type = st.selectbox(
                 "Document Type",
-                ["ultrasound", "pathology", "other"],
-                index=["ultrasound", "pathology", "other"].index(st.session_state[doc_type_key]),
+                doc_options,
+                index=current_index,
                 key=f"{key_prefix}_select_tag_doc_type",
-                label_visibility="visible"
+                label_visibility="visible",
+                format_func=lambda x: "Select..." if x is None else x
             )
             st.session_state[doc_type_key] = doc_type
     
     with col_date:
-        st.markdown(f'<span class="pill pill-date">📅 {st.session_state[date_key].strftime("%Y-%m-%d")}</span>', unsafe_allow_html=True)
+        date_display = st.session_state[date_key].strftime("%Y-%m-%d") if st.session_state[date_key] else "Select"
+        st.markdown(f'<span class="pill pill-date">📅 {date_display}</span>', unsafe_allow_html=True)
         with st.expander("📅 Date", expanded=False):
             selected_date = st.date_input(
                 "Date",
-                value=st.session_state[date_key],
+                value=st.session_state[date_key] if st.session_state[date_key] else datetime.utcnow().date(),
                 key=f"{key_prefix}_tag_date_input",
                 label_visibility="visible"
             )
@@ -551,6 +639,35 @@ def _render_tagging_pills(patient_ids: list, default_patient: str = None, key_pr
             misc_display += f" (+{len(st.session_state[misc_key]) - 1})"
         st.markdown(f'<span class="pill pill-misc">🏷️ {misc_display}</span>', unsafe_allow_html=True)
         with st.expander("🏷️ Misc", expanded=False):
+            # Display selected tags with remove buttons
+            if st.session_state[misc_key]:
+                st.markdown("**Selected tags:**")
+                num_tags = len(st.session_state[misc_key])
+                
+                # Force horizontal layout using columns
+                # Display up to 10 tags per row
+                max_per_row = 10
+                
+                for row_start in range(0, num_tags, max_per_row):
+                    row_end = min(row_start + max_per_row, num_tags)
+                    row_size = row_end - row_start
+                    
+                    # Create columns for this row - this forces horizontal layout
+                    cols = st.columns(row_size)
+                    
+                    for col_idx in range(row_size):
+                        tag_idx = row_start + col_idx
+                        tag = st.session_state[misc_key][tag_idx]
+                        
+                        with cols[col_idx]:
+                            safe_tag_key = tag.replace(" ", "_").replace(",", "").replace(":", "").replace("'", "").replace('"', "")[:30]
+                            if st.button(f"❌ {tag}", key=f"{key_prefix}_remove_{tag_idx}_{safe_tag_key}", use_container_width=True):
+                                st.session_state[misc_key].pop(tag_idx)
+                                st.session_state[f"{key_prefix}_input_misc_tags"] = ", ".join(st.session_state[misc_key])
+                                st.rerun()
+                
+                st.markdown("---")
+            
             misc_tags_input_key = f"{key_prefix}_input_misc_tags"
             # Sync text input with tags list - update if tags were added via buttons
             current_tags_str = ", ".join(st.session_state[misc_key]) if st.session_state[misc_key] else ""
@@ -565,10 +682,10 @@ def _render_tagging_pills(patient_ids: list, default_patient: str = None, key_pr
                     st.session_state[misc_tags_input_key] = current_tags_str
             
             misc_tags = st.text_input(
-                "Misc Tags",
+                "Add/Edit Tags",
                 value=st.session_state[misc_tags_input_key],
                 key=misc_tags_input_key,
-                help="Comma-separated tags (e.g., 'urgent, follow-up, routine')",
+                help="Comma-separated tags (e.g., 'urgent, follow-up, routine'). Use buttons above to remove tags.",
                 label_visibility="visible"
             )
             # Update tags list based on the text input value
@@ -584,8 +701,8 @@ def _render_tagging_pills(patient_ids: list, default_patient: str = None, key_pr
     
     return {
         "patient_id": st.session_state[patient_key],
-        "document_type": st.session_state[doc_type_key],
-        "date": st.session_state[date_key].strftime("%Y-%m-%d"),
+        "document_type": st.session_state[doc_type_key] if st.session_state[doc_type_key] else "other",
+        "date": st.session_state[date_key].strftime("%Y-%m-%d") if st.session_state[date_key] else datetime.utcnow().strftime("%Y-%m-%d"),
         "miscellaneous_tags": st.session_state[misc_key]
         # Note: filter_logic is NOT used during upload - it's only used during search
         # The AND/OR toggle you see in the search section controls how multiple filters are combined when querying
@@ -1239,25 +1356,82 @@ with col_smisc:
 
 st.markdown('</div>', unsafe_allow_html=True)
 
+# Initialize chat session state
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+if "bedrock_session_id" not in st.session_state:
+    st.session_state.bedrock_session_id = None  # Bedrock will generate this on first request
+if "input_key_counter" not in st.session_state:
+    st.session_state.input_key_counter = 0
+
+# Chat container with scrollable messages
+if st.session_state.chat_messages:
+    # Chat header with New Chat button
+    chat_header_col1, chat_header_col2 = st.columns([1, 0.1])
+    with chat_header_col1:
+        st.markdown("**Chat History**")
+    with chat_header_col2:
+        if st.button("🔄", key="new_chat_btn", help="Start a new chat session", use_container_width=True):
+            st.session_state.chat_messages = []
+            st.session_state.bedrock_session_id = None  # Clear Bedrock session to start fresh
+            st.session_state.input_key_counter += 1  # Reset input widget by changing key
+            st.rerun()
+    
+    # Scrollable chat container
+    chat_html = '<div class="chat-container">'
+    for msg in st.session_state.chat_messages:
+        role = msg.get("role", "assistant")
+        content = msg.get("content", "")
+        timestamp = msg.get("timestamp", "")
+        timestamp_str = timestamp.strftime("%H:%M") if timestamp else ""
+        
+        # Escape HTML for user messages, but allow HTML for assistant responses (which come as HTML from Lambda)
+        if role == "user":
+            content_escaped = html.escape(content)
+        else:
+            content_escaped = content  # Assistant content is already HTML from Lambda
+        
+        chat_html += f'<div class="chat-message {role}">'
+        chat_html += f'<div class="chat-bubble {role}">'
+        if role == "assistant":
+            # For assistant, render HTML directly
+            chat_html += f'<div>{content_escaped}</div>'
+        else:
+            # For user, use escaped text
+            chat_html += f'<div>{content_escaped}</div>'
+        if timestamp_str:
+            chat_html += f'<div class="chat-timestamp">{timestamp_str}</div>'
+        chat_html += '</div></div>'
+    chat_html += '</div>'
+    st.markdown(chat_html, unsafe_allow_html=True)
+else:
+    # Empty state - show New Chat button if needed
+    col_empty1, col_empty2 = st.columns([1, 0.1])
+    with col_empty1:
+        st.info("💬 Start a conversation by asking a question below")
+    with col_empty2:
+        if st.button("🔄 New Chat", key="new_chat_btn_empty", help="Start a new chat session", use_container_width=True, disabled=True):
+            pass
+
 # init keys once
-st.session_state.setdefault("query_text_input", "")
-st.session_state.setdefault("last_results", None)
 st.session_state.setdefault("run_q", None)
 st.session_state.setdefault("prefill_text", None)  # <-- temp buffer for voice text
 
-# If we have a pending prefill from transcription, apply it BEFORE rendering the input
+# Get prefill text if available (before widget creation)
+prefill_value = ""
 if st.session_state["prefill_text"] is not None:
-    st.session_state["query_text_input"] = st.session_state["prefill_text"]
+    prefill_value = st.session_state["prefill_text"]
     st.session_state["prefill_text"] = None
 
 # input row: text box + mic only
 c1, c2 = st.columns([12, 1])
 with c1:
     st.text_input(
-        "Enter your search query:",
-        key="query_text_input",
+        "Enter your message:",
+        key=f"query_text_input_{st.session_state.input_key_counter}",
+        value=prefill_value,
         label_visibility="collapsed",
-        placeholder="Type your question… or tap the mic"
+        placeholder="Type your message… or tap the mic"
     )
 with c2:
     audio = mic_recorder(
@@ -1270,7 +1444,7 @@ with c2:
     )
 
 # search button BELOW the input bar
-do_search = st.button("Search", type="primary", use_container_width=True)
+do_search = st.button("Send", type="primary", use_container_width=True)
 
 # if mic captured audio: upload → transcribe → stash to prefill_text → rerun
 if audio and audio.get("bytes"):
@@ -1301,11 +1475,12 @@ if audio and audio.get("bytes"):
     except Exception as e:
         st.error(f"Voice capture failed: {e}")
 st.divider()
-# Handle Search click (no auto-clearing per your request)
+# Handle Send click
 if do_search:
-    q = (st.session_state.get("query_text_input") or "").strip()
+    current_input_key = f"query_text_input_{st.session_state.input_key_counter}"
+    q = (st.session_state.get(current_input_key) or "").strip()
     if not q:
-        st.warning("Please enter a search query.")
+        st.warning("Please enter a message.")
     else:
         st.session_state["run_q"] = q
         st.rerun()
@@ -1314,6 +1489,13 @@ if do_search:
 if st.session_state.get("run_q"):
     run_q = st.session_state["run_q"]
     st.session_state["run_q"] = None
+    
+    # Add user message to chat history
+    st.session_state.chat_messages.append({
+        "role": "user",
+        "content": run_q,
+        "timestamp": datetime.now()
+    })
     
     # Build filter parameters from search pills
     # Use search pills if any are selected, otherwise use all patients
@@ -1334,21 +1516,31 @@ if st.session_state.get("run_q"):
             "miscellaneous_tags": st.session_state.search_misc_tags
         }
     
-    with st.spinner("Searching KB…"):
-        out = search_transcript(sub, kb_id, run_q, patient_ids_filter, filter_params)
-    st.session_state["last_results"] = out
-    st.rerun()
-
-# render results (if any)
-if st.session_state.get("last_results"):
-    res = st.session_state["last_results"]
-    if "error" in res:
-        st.error(res["error"])
-    elif "body" in res:
-        st.subheader("Search Results")
-        st.markdown(res["body"], unsafe_allow_html=True)
+    with st.spinner("Thinking…"):
+        # Pass Bedrock sessionId for conversation context (None for first request)
+        out = search_transcript(sub, kb_id, run_q, patient_ids_filter, filter_params, st.session_state.bedrock_session_id)
+    
+    # Store the sessionId from response for next request
+    if "sessionId" in out and out["sessionId"]:
+        st.session_state.bedrock_session_id = out["sessionId"]
+    
+    # Add assistant response to chat history
+    if "error" in out:
+        assistant_content = f"Error: {out['error']}"
+    elif "body" in out:
+        assistant_content = out["body"]
     else:
-        st.info("No content returned.")
+        assistant_content = "No content returned."
+    
+    st.session_state.chat_messages.append({
+        "role": "assistant",
+        "content": assistant_content,
+        "timestamp": datetime.now()
+    })
+    
+    # Clear the input after sending by incrementing the key counter
+    st.session_state.input_key_counter += 1
+    st.rerun()
 
 
 
@@ -1472,9 +1664,6 @@ if typed_content.strip():
             results.append(f"Document Type: {st.session_state.note_tag_document_type}")
         if st.session_state.get("note_suggested_tags"):
             results.append(f"Suggested {len(st.session_state.note_suggested_tags)} tags")
-        
-        if results:
-            st.success(" | ".join(results))
     
     # Show suggested tags if available
     if st.session_state.get("note_show_suggestions") and st.session_state.get("note_suggested_tags"):
@@ -1493,10 +1682,19 @@ if typed_content.strip():
                 else:
                     st.button(f"✓ {tag}", key=f"added_tag_note_{idx}", use_container_width=True, disabled=True)
         
-        if st.button("Clear suggestions", key="clear_suggestions_note"):
-            st.session_state.note_show_suggestions = False
-            st.session_state.note_suggested_tags = []
-            st.rerun()
+        # Add "Select All" and "Clear suggestions" buttons
+        col_select_all, col_clear = st.columns([1, 1])
+        with col_select_all:
+            tags_to_add = [tag for tag in suggested if tag not in current_tags]
+            if tags_to_add:
+                if st.button("Select All", key="select_all_note", use_container_width=True):
+                    st.session_state.note_tag_misc.extend(tags_to_add)
+                    st.rerun()
+        with col_clear:
+            if st.button("Clear suggestions", key="clear_suggestions_note", use_container_width=True):
+                st.session_state.note_show_suggestions = False
+                st.session_state.note_suggested_tags = []
+                st.rerun()
 
 col_btn1, col_btn2 = st.columns([1, 1])
 with col_btn1:
@@ -1540,9 +1738,9 @@ if save_btn:
             file_bytes = typed_content.encode("utf-8")
             auto_name = f"note-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.md"
             
-            # Auto-detect document type if still "other" and content exists
-            doc_type = tags["document_type"]
-            if doc_type == "other" and typed_content.strip():
+            # Auto-detect document type if still "other" or None and content exists
+            doc_type = tags["document_type"] if tags["document_type"] else "other"
+            if (doc_type == "other" or doc_type is None) and typed_content.strip():
                 with st.spinner("Auto-detecting document type..."):
                     doc_type = _extract_document_type(typed_content)
                     # Update session state so UI reflects the detected type
@@ -1562,6 +1760,14 @@ if save_btn:
             if save_and_ingest:
                 job_id = _start_ingestion(kb_id, data_source_id)
                 st.info(f"Started ingestion job: {job_id}. Click 'Refresh KB status' to check progress.")
+            
+            # Reset note tags after successful save
+            st.session_state.note_tag_patient_id = None
+            st.session_state.note_tag_document_type = None
+            st.session_state.note_tag_date = None
+            st.session_state.note_tag_misc = []
+            # Note: Cannot reset note_text_area directly as it's a widget value
+            # The text area will remain, but tags are reset for next entry
         except Exception as e:
             st.error(f"Failed to save or ingest note: {e}")
 
@@ -1666,9 +1872,6 @@ if uploaded_files:
                 results.append(f"Document Type: {st.session_state.upload_tag_document_type}")
             if st.session_state.get("upload_suggested_tags"):
                 results.append(f"Suggested {len(st.session_state.upload_suggested_tags)} tags")
-            
-            if results:
-                st.success(" | ".join(results))
         
         # Show suggested tags if available
         if st.session_state.get("upload_show_suggestions") and st.session_state.get("upload_suggested_tags"):
@@ -1687,10 +1890,19 @@ if uploaded_files:
                     else:
                         st.button(f"✓ {tag}", key=f"added_tag_upload_{idx}", use_container_width=True, disabled=True)
             
-            if st.button("Clear suggestions", key="clear_suggestions_upload"):
-                st.session_state.upload_show_suggestions = False
-                st.session_state.upload_suggested_tags = []
-                st.rerun()
+            # Add "Select All" and "Clear suggestions" buttons
+            col_select_all, col_clear = st.columns([1, 1])
+            with col_select_all:
+                tags_to_add = [tag for tag in suggested if tag not in current_tags]
+                if tags_to_add:
+                    if st.button("✅ Select All", key="select_all_upload", use_container_width=True):
+                        st.session_state.upload_tag_misc.extend(tags_to_add)
+                        st.rerun()
+            with col_clear:
+                if st.button("Clear suggestions", key="clear_suggestions_upload", use_container_width=True):
+                    st.session_state.upload_show_suggestions = False
+                    st.session_state.upload_suggested_tags = []
+                    st.rerun()
         
         st.markdown("---")
 
@@ -1732,10 +1944,10 @@ if (do_ingest or just_upload):
                 file_bytes = f.read()
                 
                 # Use the document type from tags (which may have been auto-detected)
-                doc_type = upload_tags["document_type"]
+                doc_type = upload_tags["document_type"] if upload_tags["document_type"] else "other"
                 
-                # If still "other", try to auto-detect during upload (but don't update UI at this point)
-                if doc_type == "other":
+                # If still "other" or None, try to auto-detect during upload (but don't update UI at this point)
+                if doc_type == "other" or doc_type is None:
                     # Try to read text from file for document type detection
                     try:
                         if key.lower().endswith('.txt') or key.lower().endswith('.md'):
@@ -1770,5 +1982,11 @@ if (do_ingest or just_upload):
             if do_ingest:
                 job_id = _start_ingestion(kb_id, data_source_id)
                 st.info(f"Started ingestion job: {job_id}. Click 'Refresh KB status' above to check progress.")
+            
+            # Reset upload tags after successful upload
+            st.session_state.upload_tag_patient_id = None
+            st.session_state.upload_tag_document_type = None
+            st.session_state.upload_tag_date = None
+            st.session_state.upload_tag_misc = []
         except Exception as e:
             st.error(f"Upload/ingest failed: {e}")
